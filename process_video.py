@@ -14,13 +14,22 @@ import subprocess
 from pathlib import Path
 
 from groq import Groq
-import google.generativeai as genai
+from google import genai
 
 
 def download_video(url: str, out_path: str) -> str:
-    """Download a video from a URL (YouTube or direct link) using yt-dlp."""
+    """Download a video from a URL (YouTube or direct link) using yt-dlp.
+    Uses the Android client fingerprint since YouTube frequently blocks
+    plain requests coming from data-center IPs like GitHub Actions."""
     subprocess.run(
-        ["yt-dlp", "-f", "mp4", "-o", out_path, url],
+        [
+            "yt-dlp", "-f", "mp4", "-o", out_path,
+            "--extractor-args", "youtube:player_client=android",
+            "--user-agent",
+            "Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/122.0 Mobile Safari/537.36",
+            url,
+        ],
         check=True,
     )
     return out_path
@@ -53,8 +62,7 @@ def transcribe(audio_path: str, api_key: str) -> dict:
 
 def pick_clips(transcript: dict, api_key: str, min_clips: int, max_clips: int) -> list:
     """Ask Gemini which segments make good short clips."""
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-3.1-flash-lite")
+    client = genai.Client(api_key=api_key)
 
     segments = transcript.get("segments", [])
     transcript_text = "\n".join(
@@ -71,7 +79,9 @@ Reply with ONLY a JSON array, no other text, no markdown fences, in this exact f
 [{{"start": 12.5, "end": 45.0, "title": "short catchy title"}}]
 """
 
-    response = model.generate_content(prompt)
+    response = client.models.generate_content(
+        model="gemini-3.1-flash-lite", contents=prompt
+    )
     text = response.text.strip()
     text = text.replace("```json", "").replace("```", "").strip()
     return json.loads(text)
