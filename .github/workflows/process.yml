@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: "YouTube URL or direct video URL"
+        description: "Direct URL to the video file (e.g. an uploaded video link)"
         required: true
   repository_dispatch:
     types: [process-video]
