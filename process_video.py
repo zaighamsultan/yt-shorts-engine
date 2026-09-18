@@ -13,25 +13,18 @@ import argparse
 import subprocess
 from pathlib import Path
 
+import requests
 from groq import Groq
 from google import genai
 
 
-def download_video(url: str, out_path: str) -> str:
-    """Download a video from a URL (YouTube or direct link) using yt-dlp.
-    Uses the Android client fingerprint since YouTube frequently blocks
-    plain requests coming from data-center IPs like GitHub Actions."""
-    subprocess.run(
-        [
-            "yt-dlp", "-f", "mp4", "-o", out_path,
-            "--extractor-args", "youtube:player_client=android",
-            "--user-agent",
-            "Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/122.0 Mobile Safari/537.36",
-            url,
-        ],
-        check=True,
-    )
+def download_video(source: str, out_path: str) -> str:
+    """Fetch a video from a direct URL (e.g. an uploaded file link) to out_path."""
+    response = requests.get(source, stream=True, timeout=120)
+    response.raise_for_status()
+    with open(out_path, "wb") as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            f.write(chunk)
     return out_path
 
 
@@ -110,7 +103,7 @@ def cut_vertical_clip(video_path: str, start: float, end: float, output_path: st
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--video", required=True, help="YouTube URL or direct video URL")
+    parser.add_argument("--video", required=True, help="Direct URL to the video file (e.g. an uploaded video link)")
     parser.add_argument("--output-dir", default="output")
     parser.add_argument("--min-clips", type=int, default=3)
     parser.add_argument("--max-clips", type=int, default=6)
