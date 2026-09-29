@@ -1,6 +1,6 @@
 """
 Simple YouTube-to-Shorts engine.
-Takes a video URL (direct video file link) or a local file, transcribes it,
+Takes a video URL (YouTube link or direct video file link), transcribes it,
 asks Gemini to pick the best short moments, and cuts vertical (9:16) clips.
 
 Runs on GitHub Actions (free tier) - no server needed.
@@ -101,7 +101,7 @@ STOPWORDS = {
     "a", "an", "the", "is", "are", "was", "were", "in", "on", "at", "to",
     "of", "and", "or", "but", "it", "this", "that", "you", "i", "we",
     "they", "he", "she", "know", "just", "so", "like", "with", "for",
-    "as", "be", "been", "from", "your", "my", "our", "not", "do",
+    "as", "be", "been", "from", "your", "my", "our", "be", "not", "do",
     "did", "will", "would", "can", "could", "there", "what", "when",
 }
 
@@ -145,7 +145,8 @@ def build_captions_ass(
     """Build an ASS caption file for the segments inside one clip. Common
     (stop) words stay white; other words cycle through a set of bright
     colors word by word, so the caption highlights the meaningful words.
-    If a title is given, it's shown at the top for the first few seconds."""
+    If a title is given, it's shown at the top for the first few seconds
+    with alternating big/small word sizes, modern-bold-caption style."""
     clip_segments = [
         s for s in segments
         if s["end"] > clip_start and s["start"] < clip_end
@@ -176,7 +177,7 @@ def build_captions_ass(
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
         "Style: Default,DejaVu Sans,92,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
-        "-1,0,0,0,100,100,0,0,1,3,0,2,10,10,250,1\n"
+        "-1,0,0,0,100,100,0,0,1,3,0,2,10,10,50,1\n"
         "Style: Title,DejaVu Sans,52,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
         "-1,0,0,0,100,100,0,0,1,4,0,8,40,40,90,1\n\n"
         "[Events]\n"
@@ -261,24 +262,18 @@ def cut_vertical_clip(
     start: float,
     end: float,
     output_path: str,
-    ass_path: str = None,
+    srt_path: str = None,
+    title: str = None,
     brand_text: str = None,
 ):
-    """Cut a segment into a true 1080x1920 (9:16) clip: the original video
-    fitted in the center (no stretching), with a blurred, cropped copy of
-    the same video filling the top and bottom. Then burn in the captions
-    and an optional small brand watermark."""
+    """Cut a segment, convert it to a 9:16 vertical clip with a blurred
+    background, show the AI-picked title for the first 2.5s, burn in
+    boxed captions, and add an optional small brand watermark."""
     duration = end - start
     filters = [
-        # Fix non-square pixels first, then split into background/foreground
-        "[0:v]scale='trunc(iw*sar/2)*2':ih,setsar=1,split=2[bgsrc][fgsrc]",
-        # Background: scale to COVER 1080x1920, crop the excess, then blur
-        "[bgsrc]scale=1080:1920:force_original_aspect_ratio=increase,"
-        "crop=1080:1920,boxblur=25:5,setsar=1[bg]",
-        # Foreground: scale to FIT inside 1080x1920, keep aspect ratio
-        "[fgsrc]scale=1080:1920:force_original_aspect_ratio=decrease:force_divisible_by=2,"
-        "setsar=1[fg]",
-        "[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[base]",
+        "[0:v]scale=1080:1920,boxblur=20:5[bg]",
+        "[0:v]scale=1080:-2[fg]",
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2[base]",
     ]
     current = "[base]"
 
@@ -286,14 +281,14 @@ def cut_vertical_clip(
         safe_brand = escape_drawtext(brand_text)
         filters.append(
             f"{current}drawtext=fontfile={FONT_PATH}:text='{safe_brand}':"
-        "fontsize=28:fontcolor=white@0.85:borderw=2:bordercolor=black@0.6:"
-        "x=w-text_w-30:y=h-60[branded]"
+            "fontsize=28:fontcolor=white@0.85:borderw=2:bordercolor=black@0.6:"
+            "x=w-text_w-30:y=h-60[branded]"
         )
         current = "[branded]"
 
-    if ass_path:
-        safe_ass_path = ffmpeg_path_forward_slashes(ass_path)
-        filters.append(f"{current}subtitles='{safe_ass_path}'[out]")
+    if srt_path:
+        safe_srt_path = ffmpeg_path_forward_slashes(srt_path)
+        filters.append(f"{current}subtitles='{safe_srt_path}'[out]")
         current = "[out]"
 
     filter_complex = ";".join(filters)
@@ -306,9 +301,7 @@ def cut_vertical_clip(
             "-filter_complex", filter_complex,
             "-map", current,
             "-map", "0:a?",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p",
             "-c:a", "aac",
-            "-movflags", "+faststart",
             output_path,
         ],
         check=True,
@@ -317,11 +310,11 @@ def cut_vertical_clip(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--video", required=True, help="Direct URL to the video file (e.g. an uploaded video link) or a local file path")
+    parser.add_argument("--video", required=True, help="Direct URL to the video file (e.g. an uploaded video link)")
     parser.add_argument("--output-dir", default="output")
     parser.add_argument("--min-clips", type=int, default=3)
     parser.add_argument("--max-clips", type=int, default=6)
-    parser.add_argument("--brand-text", default=None, help="Optional watermark text shown on every clip")
+    parser.add_argument("--brand-text", default=None, help="Optional watermark text shown in the corner of every clip")
     args = parser.parse_args()
 
     groq_key = os.environ["GROQ_API_KEY"]
@@ -355,11 +348,11 @@ def main():
     print(f"Cutting {len(clips)} clips...")
     for i, clip in enumerate(clips, start=1):
         clip_path = str(out_dir / f"clip_{i}.mp4")
-        ass_path = str(out_dir / f"clip_{i}.ass")
-        build_captions_ass(segments, clip["start"], clip["end"], ass_path, title=clip.get("title"))
+        srt_path = str(out_dir / f"clip_{i}.ass")
+        build_captions_ass(segments, clip["start"], clip["end"], srt_path, title=clip.get("title"))
         cut_vertical_clip(
             video_path, clip["start"], clip["end"], clip_path,
-            ass_path=ass_path,
+            srt_path=srt_path,
             brand_text=args.brand_text,
         )
         print(f"  saved {clip_path} - {clip.get('title', '')}")
