@@ -9,6 +9,7 @@ Runs on GitHub Actions (free tier) - no server needed.
 import os
 import sys
 import json
+import shutil
 import argparse
 import subprocess
 from pathlib import Path
@@ -19,12 +20,16 @@ from google import genai
 
 
 def download_video(source: str, out_path: str) -> str:
-    """Fetch a video from a direct URL (e.g. an uploaded file link) to out_path."""
-    response = requests.get(source, stream=True, timeout=120)
-    response.raise_for_status()
-    with open(out_path, "wb") as f:
-        for chunk in response.iter_content(chunk_size=8192):
-            f.write(chunk)
+    """Get the video to a local path. Downloads it if source is a URL,
+    otherwise copies it (for running locally with a file on your PC)."""
+    if source.startswith("http://") or source.startswith("https://"):
+        response = requests.get(source, stream=True, timeout=120)
+        response.raise_for_status()
+        with open(out_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+    else:
+        shutil.copy(source, out_path)
     return out_path
 
 
@@ -44,14 +49,14 @@ def extract_audio(video_path: str, audio_path: str) -> str:
 def transcribe(audio_path: str, api_key: str) -> dict:
     """Translate the audio to English with Groq's Whisper API, regardless of
     the spoken language, so captions always come out in readable English.
-    Returns verbose JSON with both segment-level and word-level timestamps."""
+    Returns verbose JSON with segment-level timestamps (the translation
+    endpoint does not support word-level timestamps)."""
     client = Groq(api_key=api_key)
     with open(audio_path, "rb") as f:
         result = client.audio.translations.create(
             file=(os.path.basename(audio_path), f.read()),
             model="whisper-large-v3",
             response_format="verbose_json",
-            timestamp_granularities=["word", "segment"],
         )
     return result.model_dump() if hasattr(result, "model_dump") else json.loads(result.json())
 
@@ -91,23 +96,31 @@ def format_srt_time(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def build_captions_srt(words: list, clip_start: float, clip_end: float, srt_path: str, words_per_line: int = 4):
-    """Build an SRT caption file for the words that fall inside one clip,
-    with timestamps shifted so the clip's own start is time zero."""
-    clip_words = [
-        w for w in words
-        if w["start"] >= clip_start and w["end"] <= clip_end
+def build_captions_srt(segments: list, clip_start: float, clip_end: float, srt_path: str, words_per_line: int = 5):
+    """Build an SRT caption file for the segments that fall inside one clip.
+    Since the translation endpoint only gives per-segment timestamps (not
+    per-word), each segment's words are split into small groups and spread
+    evenly across that segment's time range."""
+    clip_segments = [
+        s for s in segments
+        if s["end"] > clip_start and s["start"] < clip_end
     ]
 
     lines = []
-    for i in range(0, len(clip_words), words_per_line):
-        chunk = clip_words[i:i + words_per_line]
-        if not chunk:
+    for seg in clip_segments:
+        seg_start = max(seg["start"], clip_start)
+        seg_end = min(seg["end"], clip_end)
+        words = seg["text"].strip().split()
+        if not words:
             continue
-        start = chunk[0]["start"] - clip_start
-        end = chunk[-1]["end"] - clip_start
-        text = " ".join(w["word"].strip() for w in chunk)
-        lines.append((start, end, text))
+        n_chunks = max(1, -(-len(words) // words_per_line))  # ceil division
+        chunk_duration = (seg_end - seg_start) / n_chunks
+        for chunk_idx, i in enumerate(range(0, len(words), words_per_line)):
+            chunk_words = words[i:i + words_per_line]
+            c_start = seg_start + chunk_idx * chunk_duration - clip_start
+            c_end = c_start + chunk_duration
+            text = " ".join(chunk_words)
+            lines.append((max(0, c_start), c_end, text))
 
     with open(srt_path, "w", encoding="utf-8") as f:
         for idx, (start, end, text) in enumerate(lines, start=1):
@@ -126,7 +139,28 @@ def escape_drawtext(text: str) -> str:
     )
 
 
-FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+def find_font_path() -> str:
+    """Find a bold font that exists on this machine, Linux (GitHub Actions) or Windows."""
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",  # Linux (GitHub Actions)
+        "C:/Windows/Fonts/arialbd.ttf",  # Windows
+        "C:/Windows/Fonts/Arial Bold.ttf",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]
+
+
+def ffmpeg_path_forward_slashes(path: str) -> str:
+    """Convert backslashes to forward slashes. The path itself gets wrapped
+    in single quotes at the point of use, which is the reliable way to keep
+    a Windows drive-letter colon (C:) from being misread as an ffmpeg
+    filter option separator."""
+    return path.replace("\\", "/")
+
+
+FONT_PATH = ffmpeg_path_forward_slashes(find_font_path())
 
 
 def cut_vertical_clip(
@@ -152,7 +186,7 @@ def cut_vertical_clip(
     if title:
         safe_title = escape_drawtext(title)
         filters.append(
-            f"{current}drawtext=fontfile={FONT_PATH}:text='{safe_title}':"
+            f"{current}drawtext=fontfile='{FONT_PATH}':text='{safe_title}':"
             "fontsize=52:fontcolor=white:borderw=4:bordercolor=black:"
             "x=(w-text_w)/2:y=140:enable='lt(t,2.5)'[titled]"
         )
@@ -161,7 +195,7 @@ def cut_vertical_clip(
     if brand_text:
         safe_brand = escape_drawtext(brand_text)
         filters.append(
-            f"{current}drawtext=fontfile={FONT_PATH}:text='{safe_brand}':"
+            f"{current}drawtext=fontfile='{FONT_PATH}':text='{safe_brand}':"
             "fontsize=28:fontcolor=white@0.85:borderw=2:bordercolor=black@0.6:"
             "x=w-text_w-30:y=h-60[branded]"
         )
@@ -174,7 +208,8 @@ def cut_vertical_clip(
             "BackColour=&HB0000000,BorderStyle=3,Outline=14,Shadow=0,"
             "Alignment=2,MarginV=50"
         )
-        filters.append(f"{current}subtitles={srt_path}:force_style='{style}'[out]")
+        safe_srt_path = ffmpeg_path_forward_slashes(srt_path)
+        filters.append(f"{current}subtitles='{safe_srt_path}':force_style='{style}'[out]")
         current = "[out]"
 
     filter_complex = ";".join(filters)
@@ -227,13 +262,13 @@ def main():
     with open(out_dir / "clips_metadata.json", "w") as f:
         json.dump(clips, f, indent=2)
 
-    words = transcript.get("words", [])
+    segments = transcript.get("segments", [])
 
     print(f"Cutting {len(clips)} clips...")
     for i, clip in enumerate(clips, start=1):
         clip_path = str(out_dir / f"clip_{i}.mp4")
         srt_path = str(out_dir / f"clip_{i}.srt")
-        build_captions_srt(words, clip["start"], clip["end"], srt_path)
+        build_captions_srt(segments, clip["start"], clip["end"], srt_path)
         cut_vertical_clip(
             video_path, clip["start"], clip["end"], clip_path,
             srt_path=srt_path,
