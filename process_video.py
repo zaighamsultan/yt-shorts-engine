@@ -42,11 +42,12 @@ def extract_audio(video_path: str, audio_path: str) -> str:
 
 
 def transcribe(audio_path: str, api_key: str) -> dict:
-    """Transcribe audio with Groq's Whisper API. Returns verbose JSON with
-    both segment-level and word-level timestamps."""
+    """Translate the audio to English with Groq's Whisper API, regardless of
+    the spoken language, so captions always come out in readable English.
+    Returns verbose JSON with both segment-level and word-level timestamps."""
     client = Groq(api_key=api_key)
     with open(audio_path, "rb") as f:
-        result = client.audio.transcriptions.create(
+        result = client.audio.translations.create(
             file=(os.path.basename(audio_path), f.read()),
             model="whisper-large-v3",
             response_format="verbose_json",
@@ -170,8 +171,8 @@ def cut_vertical_clip(
         style = (
             "FontName=DejaVu Sans,FontSize=20,Bold=1,"
             "PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,"
-            "BackColour=&H90000000,BorderStyle=3,Outline=1,"
-            "Alignment=2,MarginV=90"
+            "BackColour=&HB0000000,BorderStyle=3,Outline=14,Shadow=0,"
+            "Alignment=2,MarginV=50"
         )
         filters.append(f"{current}subtitles={srt_path}:force_style='{style}'[out]")
         current = "[out]"
