@@ -125,6 +125,7 @@ def pick_clips(transcript: dict, api_key: str, min_clips: int, max_clips: int) -
 
     prompt = f"""You are picking short, engaging clips (15-60 seconds each) from a video transcript
 for YouTube Shorts / TikTok / Reels. Pick between {min_clips} and {max_clips} clips.
+Write each title in the same language as the transcript.
 
 Transcript with timestamps:
 {transcript_text}
@@ -492,6 +493,12 @@ def main():
              "language, adds one title label, and converts to 9:16 - no clip splitting."
     )
     parser.add_argument(
+        "--clip-language", default=None,
+        help="Language name or code ('ur', 'urdu', 'hi', ...) for the captions of the "
+             "short clips (normal mode). Choose the language spoken in the video. "
+             "If not given, the speech is translated to English captions."
+    )
+    parser.add_argument(
         "--caption-colors", default=None,
         help="Comma-separated hex colors for highlighted caption words, "
              "e.g. 'FFEB3B,00E5FF,FF4081'. They are used in turn, word by word. "
@@ -573,8 +580,17 @@ def main():
 
     else:
         # --- Default mode: pick multiple short clips ---
+        clip_lang = resolve_language_code(args.clip_language) if args.clip_language else "en"
+        print(f"Clip mode - caption language: {clip_lang}")
+
         print("Transcribing with Groq...")
-        transcript = transcribe_english(audio_path, groq_key)
+        if clip_lang == "en":
+            transcript = transcribe_english(audio_path, groq_key)
+            clip_fonts_dir, clip_font_family = None, "DejaVu Sans"
+        else:
+            transcript = transcribe_in_language(audio_path, groq_key, clip_lang)
+            clip_fonts_dir, clip_font_family = resolve_caption_font(clip_lang)
+            print(f"Caption font: {clip_font_family}")
         with open(out_dir / "transcript.json", "w") as f:
             json.dump(transcript, f, indent=2)
 
@@ -592,6 +608,7 @@ def main():
             build_captions_ass(
                 segments, clip["start"], clip["end"], ass_path,
                 title=clip.get("title"),
+                caption_font_family=clip_font_family,
                 colors=caption_colors,
                 important_size=important_size,
                 common_size=common_size,
@@ -600,6 +617,7 @@ def main():
                 video_path, clip["start"], clip["end"], clip_path,
                 ass_path=ass_path,
                 brand_text=args.brand_text,
+                fonts_dir=clip_fonts_dir,
             )
             print(f"  saved {clip_path} - {clip.get('title', '')}")
 
