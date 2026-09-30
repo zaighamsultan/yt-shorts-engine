@@ -210,6 +210,7 @@ def build_captions_ass(
     title: str = None,
     title_duration: float = 2.5,
     words_per_line: int = 5,
+    caption_font_family: str = "DejaVu Sans",
 ):
     """Build an ASS caption file for the segments inside one clip. Common
     (stop) words stay white; other words cycle through a set of bright
@@ -244,7 +245,7 @@ def build_captions_ass(
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        "Style: Default,DejaVu Sans,92,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
+        f"Style: Default,{caption_font_family},92,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
         "-1,0,0,0,100,100,0,0,1,3,0,2,10,10,250,1\n"
         "Style: Title,DejaVu Sans,52,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
         "-1,0,0,0,100,100,0,0,1,4,0,8,40,40,90,1\n\n"
@@ -296,7 +297,7 @@ def escape_drawtext(text: str) -> str:
 
 
 def find_system_font() -> str:
-    """Find a bold font that exists on this machine, Linux (GitHub Actions) or Windows."""
+    """Find a bold Latin font that exists on this machine, Linux (GitHub Actions) or Windows."""
     candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",  # Linux (GitHub Actions)
         "C:/Windows/Fonts/arialbd.ttf",  # Windows
@@ -324,6 +325,54 @@ def ffmpeg_path_forward_slashes(path: str) -> str:
 
 FONT_PATH = prepare_local_font()
 
+# --- Right-to-left / Urdu-Arabic script caption font support ---
+
+RTL_LANGUAGES = {"ur", "ar", "fa", "ps"}
+
+# (file path, font family name libass should look it up by)
+RTL_FONT_CANDIDATES = [
+    ("/usr/share/fonts/truetype/noto/NotoNastaliqUrdu-Regular.ttf", "Noto Nastaliq Urdu"),
+    ("/usr/share/fonts/truetype/noto/NotoNastaliqUrdu-Bold.ttf", "Noto Nastaliq Urdu"),
+    ("/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf", "Noto Sans Arabic"),
+    ("/usr/share/fonts/truetype/noto/NotoNaskhArabic-Bold.ttf", "Noto Naskh Arabic"),
+    ("C:/Windows/Fonts/Urdu Typesetting.ttf", "Urdu Typesetting"),
+    ("C:/Windows/Fonts/arabtype.ttf", "Arabic Typesetting"),
+    ("C:/Windows/Fonts/tahomabd.ttf", "Tahoma"),
+    ("C:/Windows/Fonts/tahoma.ttf", "Tahoma"),
+]
+
+
+def resolve_caption_font(lang_code: str):
+    """Pick the right font FILE and FAMILY NAME for the caption language.
+    Latin languages use the usual bold font; Urdu/Arabic/Farsi/Pashto need a
+    script that actually contains Arabic-script glyphs, copied into a local
+    fonts/ folder so libass (via ffmpeg's subtitles filter) can find it by
+    name using the fontsdir option."""
+    fonts_dir = "fonts"
+    os.makedirs(fonts_dir, exist_ok=True)
+
+    if lang_code in RTL_LANGUAGES:
+        for path, family in RTL_FONT_CANDIDATES:
+            if os.path.exists(path):
+                local_path = os.path.join(fonts_dir, os.path.basename(path))
+                if not os.path.exists(local_path):
+                    shutil.copy(path, local_path)
+                return fonts_dir, family
+        print(
+            "WARNING: no Urdu/Arabic-capable font found on this system. "
+            "Captions may show broken boxes. On Linux install 'fonts-noto-core' "
+            "and 'fonts-noto-extra'; on Windows a font like 'Urdu Typesetting' "
+            "or 'Tahoma' is needed."
+        )
+
+    # Default: Latin font, already copied by prepare_local_font()
+    default_path = find_system_font()
+    local_path = os.path.join(fonts_dir, os.path.basename(default_path))
+    if not os.path.exists(local_path):
+        shutil.copy(default_path, local_path)
+    family = "DejaVu Sans" if "DejaVu" in default_path else "Arial"
+    return fonts_dir, family
+
 
 def cut_vertical_clip(
     video_path: str,
@@ -332,6 +381,7 @@ def cut_vertical_clip(
     output_path: str,
     ass_path: str = None,
     brand_text: str = None,
+    fonts_dir: str = None,
 ):
     """Cut a segment into a true 1080x1920 (9:16) clip: the original video
     fitted in the center (no stretching), with a blurred, cropped copy of
@@ -362,7 +412,11 @@ def cut_vertical_clip(
 
     if ass_path:
         safe_ass_path = ffmpeg_path_forward_slashes(ass_path)
-        filters.append(f"{current}subtitles='{safe_ass_path}'[out]")
+        if fonts_dir:
+            safe_fonts_dir = ffmpeg_path_forward_slashes(fonts_dir)
+            filters.append(f"{current}subtitles='{safe_ass_path}':fontsdir='{safe_fonts_dir}'[out]")
+        else:
+            filters.append(f"{current}subtitles='{safe_ass_path}'[out]")
         current = "[out]"
 
     filter_complex = ";".join(filters)
@@ -435,13 +489,17 @@ def main():
         segments = transcript.get("segments", [])
         duration = get_video_duration(video_path)
 
+        fonts_dir, font_family = resolve_caption_font(lang_code)
+        print(f"Caption font: {font_family}")
+
         clip_path = str(out_dir / "captioned.mp4")
         ass_path = str(out_dir / "captions.ass")
-        build_captions_ass(segments, 0, duration, ass_path, title=label)
+        build_captions_ass(segments, 0, duration, ass_path, title=label, caption_font_family=font_family)
         cut_vertical_clip(
             video_path, 0, duration, clip_path,
             ass_path=ass_path,
             brand_text=args.brand_text,
+            fonts_dir=fonts_dir,
         )
         print(f"  saved {clip_path} - {label}")
 
