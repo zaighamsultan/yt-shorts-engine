@@ -4,51 +4,84 @@ on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: "Direct URL to the video file (e.g. an uploaded video link)"
+        description: "Direct link to the video file"
         required: true
       brand_text:
-        description: "Optional watermark text (leave blank for none)"
+        description: "Optional watermark text"
         required: false
+        default: ""
       caption_only:
-        description: "Optional: language for caption-only mode (e.g. 'en', 'urdu'). Leave blank for normal multi-clip mode."
+        description: "Leave empty to cut clips. Or a language code (en, ur, hi, ar...) to caption the whole video"
         required: false
-  repository_dispatch:
-    types: [process-video]
+        default: ""
+      caption_colors:
+        description: "Optional highlight colors as comma-separated hex, e.g. FFEB3B,00E5FF"
+        required: false
+        default: ""
+      important_size:
+        description: "Optional text size of important words (40-140)"
+        required: false
+        default: ""
+      common_size:
+        description: "Optional text size of common words (40-140)"
+        required: false
+        default: ""
 
 jobs:
   process:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - name: Checkout repo
+      - name: Getting things ready
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Setting up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install ffmpeg and fonts
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core fonts-noto-core fonts-noto-extra
+      - name: Installing video tools and fonts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core fonts-noto-core
+          pip install -r requirements.txt
 
-      - name: Install Python dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run processing script
+      - name: Creating your video
         env:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           GEM_API_KEY: ${{ secrets.GEM_API_KEY }}
-          VIDEO_URL: ${{ github.event.inputs.video_url || github.event.client_payload.video_url }}
-          BRAND_TEXT: ${{ github.event.inputs.brand_text || github.event.client_payload.brand_text }}
-          CAPTION_ONLY: ${{ github.event.inputs.caption_only || github.event.client_payload.caption_only }}
+          VIDEO_URL: ${{ inputs.video_url }}
+          BRAND_TEXT: ${{ inputs.brand_text }}
+          CAPTION_ONLY: ${{ inputs.caption_only }}
+          CAPTION_COLORS: ${{ inputs.caption_colors }}
+          IMPORTANT_SIZE: ${{ inputs.important_size }}
+          COMMON_SIZE: ${{ inputs.common_size }}
         run: |
-          if [ -n "$CAPTION_ONLY" ]; then
-            python process_video.py --video "$VIDEO_URL" --output-dir output --brand-text "$BRAND_TEXT" --caption-only "$CAPTION_ONLY"
-          else
-            python process_video.py --video "$VIDEO_URL" --output-dir output --brand-text "$BRAND_TEXT"
+          args=(--video "$VIDEO_URL")
+          if [ -n "$BRAND_TEXT" ]; then
+            args+=(--brand-text "$BRAND_TEXT")
           fi
+          if [ -n "$CAPTION_ONLY" ]; then
+            args+=(--caption-only "$CAPTION_ONLY")
+          fi
+          if [ -n "$CAPTION_COLORS" ]; then
+            args+=(--caption-colors "$CAPTION_COLORS")
+          fi
+          if [ -n "$IMPORTANT_SIZE" ]; then
+            args+=(--important-size "$IMPORTANT_SIZE")
+          fi
+          if [ -n "$COMMON_SIZE" ]; then
+            args+=(--common-size "$COMMON_SIZE")
+          fi
+          python process_video.py "${args[@]}"
 
-      - name: Upload clips as artifact
+      - name: Packing your files
+        run: |
+          rm -f output/project_*/source.mp4 output/project_*/audio.mp3
+
+      - name: Uploading result
         uses: actions/upload-artifact@v4
         with:
           name: clips
-          path: output/
+          path: output
+          retention-days: 1
