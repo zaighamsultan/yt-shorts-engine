@@ -1,4 +1,4 @@
- """
+"""
 Simple YouTube-to-Shorts engine.
 Takes a video URL (direct video file link) or a local file, transcribes it,
 asks Gemini to pick the best short moments, and cuts vertical (9:16) clips.
