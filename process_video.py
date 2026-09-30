@@ -1,6 +1,6 @@
 """
 Simple YouTube-to-Shorts engine.
-Takes a video URL (YouTube link or direct video file link), transcribes it,
+Takes a video URL (direct video file link) or a local file, transcribes it,
 asks Gemini to pick the best short moments, and cuts vertical (9:16) clips.
 
 Runs on GitHub Actions (free tier) - no server needed.
@@ -47,7 +47,7 @@ def extract_audio(video_path: str, audio_path: str) -> str:
     return audio_path
 
 
-def transcribe(audio_path: str, api_key: str) -> dict:
+def transcribe_english(audio_path: str, api_key: str) -> dict:
     """Translate the audio to English with Groq's Whisper API, regardless of
     the spoken language, so captions always come out in readable English.
     Returns verbose JSON with segment-level timestamps (the translation
@@ -60,6 +60,57 @@ def transcribe(audio_path: str, api_key: str) -> dict:
             response_format="verbose_json",
         )
     return result.model_dump() if hasattr(result, "model_dump") else json.loads(result.json())
+
+
+LANGUAGE_NAME_TO_CODE = {
+    "english": "en", "en": "en",
+    "urdu": "ur", "ur": "ur",
+    "hindi": "hi", "hi": "hi",
+    "arabic": "ar", "ar": "ar",
+    "spanish": "es", "es": "es",
+    "french": "fr", "fr": "fr",
+    "german": "de", "de": "de",
+    "punjabi": "pa", "pa": "pa",
+    "bengali": "bn", "bn": "bn",
+    "turkish": "tr", "tr": "tr",
+    "chinese": "zh", "zh": "zh",
+    "russian": "ru", "ru": "ru",
+    "portuguese": "pt", "pt": "pt",
+    "indonesian": "id", "id": "id",
+}
+
+
+def resolve_language_code(value: str) -> str:
+    """Accept either a language name ('urdu', 'english') or a short code
+    ('ur', 'en') and return the ISO code Whisper expects."""
+    key = value.strip().lower()
+    return LANGUAGE_NAME_TO_CODE.get(key, key)
+
+
+def transcribe_in_language(audio_path: str, api_key: str, language_code: str) -> dict:
+    """Transcribe the audio in its own language (no translation), for
+    caption-only mode when a specific caption language is requested."""
+    client = Groq(api_key=api_key)
+    with open(audio_path, "rb") as f:
+        result = client.audio.transcriptions.create(
+            file=(os.path.basename(audio_path), f.read()),
+            model="whisper-large-v3",
+            response_format="verbose_json",
+            language=language_code,
+        )
+    return result.model_dump() if hasattr(result, "model_dump") else json.loads(result.json())
+
+
+def get_video_duration(video_path: str) -> float:
+    """Read the video's total duration in seconds using ffprobe."""
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", video_path,
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    return float(result.stdout.strip())
 
 
 def pick_clips(transcript: dict, api_key: str, min_clips: int, max_clips: int) -> list:
@@ -89,6 +140,24 @@ Reply with ONLY a JSON array, no other text, no markdown fences, in this exact f
     return json.loads(text)
 
 
+def pick_label(transcript: dict, api_key: str) -> str:
+    """Ask Gemini for one short, catchy title describing the whole video
+    (used in caption-only mode, instead of picking multiple clips)."""
+    client = genai.Client(api_key=api_key)
+    segments = transcript.get("segments", [])
+    transcript_text = "\n".join(s["text"] for s in segments)
+
+    prompt = f"""Give one short, catchy title (under 10 words) that describes what this video is about.
+
+Transcript:
+{transcript_text}
+
+Reply with ONLY the title text. No quotes, no markdown, nothing else.
+"""
+    response = client.models.generate_content(model="gemini-3.1-flash-lite", contents=prompt)
+    return response.text.strip().strip('"')
+
+
 def format_srt_time(seconds: float) -> str:
     ms = int(round(seconds * 1000))
     h, ms = divmod(ms, 3600000)
@@ -101,7 +170,7 @@ STOPWORDS = {
     "a", "an", "the", "is", "are", "was", "were", "in", "on", "at", "to",
     "of", "and", "or", "but", "it", "this", "that", "you", "i", "we",
     "they", "he", "she", "know", "just", "so", "like", "with", "for",
-    "as", "be", "been", "from", "your", "my", "our", "be", "not", "do",
+    "as", "be", "been", "from", "your", "my", "our", "not", "do",
     "did", "will", "would", "can", "could", "there", "what", "when",
 }
 
@@ -145,8 +214,7 @@ def build_captions_ass(
     """Build an ASS caption file for the segments inside one clip. Common
     (stop) words stay white; other words cycle through a set of bright
     colors word by word, so the caption highlights the meaningful words.
-    If a title is given, it's shown at the top for the first few seconds
-    with alternating big/small word sizes, modern-bold-caption style."""
+    If a title is given, it's shown at the top for the first few seconds."""
     clip_segments = [
         s for s in segments
         if s["end"] > clip_start and s["start"] < clip_end
@@ -177,7 +245,7 @@ def build_captions_ass(
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
         "Style: Default,DejaVu Sans,92,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
-        "-1,0,0,0,100,100,0,0,1,3,0,2,10,10,50,1\n"
+        "-1,0,0,0,100,100,0,0,1,3,0,2,10,10,250,1\n"
         "Style: Title,DejaVu Sans,52,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
         "-1,0,0,0,100,100,0,0,1,4,0,8,40,40,90,1\n\n"
         "[Events]\n"
@@ -262,18 +330,24 @@ def cut_vertical_clip(
     start: float,
     end: float,
     output_path: str,
-    srt_path: str = None,
-    title: str = None,
+    ass_path: str = None,
     brand_text: str = None,
 ):
-    """Cut a segment, convert it to a 9:16 vertical clip with a blurred
-    background, show the AI-picked title for the first 2.5s, burn in
-    boxed captions, and add an optional small brand watermark."""
+    """Cut a segment into a true 1080x1920 (9:16) clip: the original video
+    fitted in the center (no stretching), with a blurred, cropped copy of
+    the same video filling the top and bottom. Then burn in the captions
+    and an optional small brand watermark."""
     duration = end - start
     filters = [
-        "[0:v]scale=1080:1920,boxblur=20:5[bg]",
-        "[0:v]scale=1080:-2[fg]",
-        "[bg][fg]overlay=(W-w)/2:(H-h)/2[base]",
+        # Fix non-square pixels first, then split into background/foreground
+        "[0:v]scale='trunc(iw*sar/2)*2':ih,setsar=1,split=2[bgsrc][fgsrc]",
+        # Background: scale to COVER 1080x1920, crop the excess, then blur
+        "[bgsrc]scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920,boxblur=25:5,setsar=1[bg]",
+        # Foreground: scale to FIT inside 1080x1920, keep aspect ratio
+        "[fgsrc]scale=1080:1920:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+        "setsar=1[fg]",
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[base]",
     ]
     current = "[base]"
 
@@ -281,14 +355,14 @@ def cut_vertical_clip(
         safe_brand = escape_drawtext(brand_text)
         filters.append(
             f"{current}drawtext=fontfile={FONT_PATH}:text='{safe_brand}':"
-            "fontsize=28:fontcolor=white@0.85:borderw=2:bordercolor=black@0.6:"
-            "x=w-text_w-30:y=h-60[branded]"
+        "fontsize=28:fontcolor=white@0.85:borderw=2:bordercolor=black@0.6:"
+        "x=w-text_w-30:y=h-60[branded]"
         )
         current = "[branded]"
 
-    if srt_path:
-        safe_srt_path = ffmpeg_path_forward_slashes(srt_path)
-        filters.append(f"{current}subtitles='{safe_srt_path}'[out]")
+    if ass_path:
+        safe_ass_path = ffmpeg_path_forward_slashes(ass_path)
+        filters.append(f"{current}subtitles='{safe_ass_path}'[out]")
         current = "[out]"
 
     filter_complex = ";".join(filters)
@@ -301,7 +375,9 @@ def cut_vertical_clip(
             "-filter_complex", filter_complex,
             "-map", current,
             "-map", "0:a?",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
             "-c:a", "aac",
+            "-movflags", "+faststart",
             output_path,
         ],
         check=True,
@@ -310,11 +386,17 @@ def cut_vertical_clip(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--video", required=True, help="Direct URL to the video file (e.g. an uploaded video link)")
+    parser.add_argument("--video", required=True, help="Direct URL to the video file (e.g. an uploaded video link) or a local file path")
     parser.add_argument("--output-dir", default="output")
     parser.add_argument("--min-clips", type=int, default=3)
     parser.add_argument("--max-clips", type=int, default=6)
-    parser.add_argument("--brand-text", default=None, help="Optional watermark text shown in the corner of every clip")
+    parser.add_argument("--brand-text", default=None, help="Optional watermark text shown on every clip")
+    parser.add_argument(
+        "--caption-only", default=None,
+        help="Language name or code ('en', 'english', 'urdu', ...). If given, "
+             "skips picking multiple clips: captions the WHOLE video in this "
+             "language, adds one title label, and converts to 9:16 - no clip splitting."
+    )
     args = parser.parse_args()
 
     groq_key = os.environ["GROQ_API_KEY"]
@@ -333,29 +415,61 @@ def main():
     audio_path = str(out_dir / "audio.mp3")
     extract_audio(video_path, audio_path)
 
-    print("Transcribing with Groq...")
-    transcript = transcribe(audio_path, groq_key)
-    with open(out_dir / "transcript.json", "w") as f:
-        json.dump(transcript, f, indent=2)
+    if args.caption_only:
+        # --- Caption-only mode: whole video, one label, no clip splitting ---
+        lang_code = resolve_language_code(args.caption_only)
+        print(f"Caption-only mode - language: {lang_code}")
 
-    print("Picking clips with Gemini...")
-    clips = pick_clips(transcript, gem_key, args.min_clips, args.max_clips)
-    with open(out_dir / "clips_metadata.json", "w") as f:
-        json.dump(clips, f, indent=2)
+        if lang_code == "en":
+            transcript = transcribe_english(audio_path, groq_key)
+        else:
+            transcript = transcribe_in_language(audio_path, groq_key, lang_code)
+        with open(out_dir / "transcript.json", "w") as f:
+            json.dump(transcript, f, indent=2)
 
-    segments = transcript.get("segments", [])
+        print("Labeling with Gemini...")
+        label = pick_label(transcript, gem_key)
+        with open(out_dir / "label.json", "w") as f:
+            json.dump({"title": label}, f, indent=2)
 
-    print(f"Cutting {len(clips)} clips...")
-    for i, clip in enumerate(clips, start=1):
-        clip_path = str(out_dir / f"clip_{i}.mp4")
-        srt_path = str(out_dir / f"clip_{i}.ass")
-        build_captions_ass(segments, clip["start"], clip["end"], srt_path, title=clip.get("title"))
+        segments = transcript.get("segments", [])
+        duration = get_video_duration(video_path)
+
+        clip_path = str(out_dir / "captioned.mp4")
+        ass_path = str(out_dir / "captions.ass")
+        build_captions_ass(segments, 0, duration, ass_path, title=label)
         cut_vertical_clip(
-            video_path, clip["start"], clip["end"], clip_path,
-            srt_path=srt_path,
+            video_path, 0, duration, clip_path,
+            ass_path=ass_path,
             brand_text=args.brand_text,
         )
-        print(f"  saved {clip_path} - {clip.get('title', '')}")
+        print(f"  saved {clip_path} - {label}")
+
+    else:
+        # --- Default mode: pick multiple short clips ---
+        print("Transcribing with Groq...")
+        transcript = transcribe_english(audio_path, groq_key)
+        with open(out_dir / "transcript.json", "w") as f:
+            json.dump(transcript, f, indent=2)
+
+        print("Picking clips with Gemini...")
+        clips = pick_clips(transcript, gem_key, args.min_clips, args.max_clips)
+        with open(out_dir / "clips_metadata.json", "w") as f:
+            json.dump(clips, f, indent=2)
+
+        segments = transcript.get("segments", [])
+
+        print(f"Cutting {len(clips)} clips...")
+        for i, clip in enumerate(clips, start=1):
+            clip_path = str(out_dir / f"clip_{i}.mp4")
+            ass_path = str(out_dir / f"clip_{i}.ass")
+            build_captions_ass(segments, clip["start"], clip["end"], ass_path, title=clip.get("title"))
+            cut_vertical_clip(
+                video_path, clip["start"], clip["end"], clip_path,
+                ass_path=ass_path,
+                brand_text=args.brand_text,
+            )
+            print(f"  saved {clip_path} - {clip.get('title', '')}")
 
     print("Done.")
 
