@@ -9,6 +9,9 @@ on:
       brand_text:
         description: "Optional watermark text (leave blank for none)"
         required: false
+      caption_only:
+        description: "Optional: language for caption-only mode (e.g. 'en', 'urdu'). Leave blank for normal multi-clip mode."
+        required: false
   repository_dispatch:
     types: [process-video]
 
@@ -36,7 +39,13 @@ jobs:
           GEM_API_KEY: ${{ secrets.GEM_API_KEY }}
           VIDEO_URL: ${{ github.event.inputs.video_url || github.event.client_payload.video_url }}
           BRAND_TEXT: ${{ github.event.inputs.brand_text || github.event.client_payload.brand_text }}
-        run: python process_video.py --video "$VIDEO_URL" --output-dir output --brand-text "$BRAND_TEXT"
+          CAPTION_ONLY: ${{ github.event.inputs.caption_only || github.event.client_payload.caption_only }}
+        run: |
+          if [ -n "$CAPTION_ONLY" ]; then
+            python process_video.py --video "$VIDEO_URL" --output-dir output --brand-text "$BRAND_TEXT" --caption-only "$CAPTION_ONLY"
+          else
+            python process_video.py --video "$VIDEO_URL" --output-dir output --brand-text "$BRAND_TEXT"
+          fi
 
       - name: Upload clips as artifact
         uses: actions/upload-artifact@v4
