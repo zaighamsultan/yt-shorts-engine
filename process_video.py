@@ -1,4 +1,4 @@
-"""
+ """
 Simple YouTube-to-Shorts engine.
 Takes a video URL (direct video file link) or a local file, transcribes it,
 asks Gemini to pick the best short moments, and cuts vertical (9:16) clips.
@@ -7,6 +7,7 @@ Runs on GitHub Actions (free tier) - no server needed.
 """
 
 import os
+import re
 import sys
 import json
 import shutil
@@ -184,6 +185,39 @@ WORD_COLORS = [
     (186, 104, 200),  # purple
 ]
 
+# Caption text sizes (in pixels on the 1080x1920 frame)
+DEFAULT_IMPORTANT_SIZE = 92   # important (highlighted) words
+DEFAULT_COMMON_SIZE = 64      # common words like "the", "and", "in"
+MIN_TEXT_SIZE = 40
+MAX_TEXT_SIZE = 140
+
+
+def parse_caption_colors(value):
+    """Turn 'FFEB3B,00E5FF,#FF4081' into a list of (r, g, b) tuples.
+    Invalid entries are skipped. If nothing valid is left, the default
+    color set is used."""
+    if not value:
+        return list(WORD_COLORS)
+    colors = []
+    for part in value.split(","):
+        hex_value = part.strip().lstrip("#")
+        if re.fullmatch(r"[0-9A-Fa-f]{6}", hex_value):
+            colors.append((
+                int(hex_value[0:2], 16),
+                int(hex_value[2:4], 16),
+                int(hex_value[4:6], 16),
+            ))
+    return colors or list(WORD_COLORS)
+
+
+def clamp_text_size(value, default: int) -> int:
+    """Keep a text size inside a safe range so captions always fit the frame."""
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(MIN_TEXT_SIZE, min(MAX_TEXT_SIZE, size))
+
 
 def rgb_to_ass_inline(r: int, g: int, b: int) -> str:
     """ASS inline color override tags use BGR hex order, no alpha byte."""
@@ -211,11 +245,17 @@ def build_captions_ass(
     title_duration: float = 2.5,
     words_per_line: int = 5,
     caption_font_family: str = "DejaVu Sans",
+    colors: list = None,
+    important_size: int = DEFAULT_IMPORTANT_SIZE,
+    common_size: int = DEFAULT_COMMON_SIZE,
 ):
     """Build an ASS caption file for the segments inside one clip. Common
-    (stop) words stay white; other words cycle through a set of bright
-    colors word by word, so the caption highlights the meaningful words.
+    (stop) words stay white and smaller; other words cycle through the chosen
+    bright colors word by word and use the larger size, so the caption
+    highlights the meaningful words.
     If a title is given, it's shown at the top for the first few seconds."""
+    palette = colors or WORD_COLORS
+
     clip_segments = [
         s for s in segments
         if s["end"] > clip_start and s["start"] < clip_end
@@ -245,7 +285,7 @@ def build_captions_ass(
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Default,{caption_font_family},92,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
+        f"Style: Default,{caption_font_family},{important_size},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
         "-1,0,0,0,100,100,0,0,1,3,0,2,10,10,250,1\n"
         "Style: Title,DejaVu Sans,52,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
         "-1,0,0,0,100,100,0,0,1,4,0,8,40,40,90,1\n\n"
@@ -268,12 +308,12 @@ def build_captions_ass(
             safe_w = sanitize_ass_text(w)
             if w.strip(".,!?;:").lower() in STOPWORDS:
                 color_tag = rgb_to_ass_inline(255, 255, 255)
-                size_tag = "\\fs64"
+                size_tag = f"\\fs{common_size}"
             else:
-                r, g, b = WORD_COLORS[color_i % len(WORD_COLORS)]
+                r, g, b = palette[color_i % len(palette)]
                 color_i += 1
                 color_tag = rgb_to_ass_inline(r, g, b)
-                size_tag = "\\fs92"
+                size_tag = f"\\fs{important_size}"
             parts.append(f"{{{color_tag}{size_tag}}}{safe_w}")
         text = " ".join(parts)
         dialogue_lines.append(
@@ -405,8 +445,8 @@ def cut_vertical_clip(
         safe_brand = escape_drawtext(brand_text)
         filters.append(
             f"{current}drawtext=fontfile={FONT_PATH}:text='{safe_brand}':"
-        "fontsize=28:fontcolor=white@0.85:borderw=2:bordercolor=black@0.6:"
-        "x=w-text_w-30:y=h-60[branded]"
+            "fontsize=28:fontcolor=white@0.85:borderw=2:bordercolor=black@0.6:"
+            "x=w-text_w-30:y=h-60[branded]"
         )
         current = "[branded]"
 
@@ -446,15 +486,36 @@ def main():
     parser.add_argument("--max-clips", type=int, default=6)
     parser.add_argument("--brand-text", default=None, help="Optional watermark text shown on every clip")
     parser.add_argument(
-        "--caption-only", default='urdu',
+        "--caption-only", default=None,
         help="Language name or code ('en', 'english', 'urdu', ...). If given, "
              "skips picking multiple clips: captions the WHOLE video in this "
              "language, adds one title label, and converts to 9:16 - no clip splitting."
+    )
+    parser.add_argument(
+        "--caption-colors", default=None,
+        help="Comma-separated hex colors for highlighted caption words, "
+             "e.g. 'FFEB3B,00E5FF,FF4081'. They are used in turn, word by word. "
+             "Default: yellow, cyan, pink, orange, green, red, purple."
+    )
+    parser.add_argument(
+        "--important-size", type=int, default=DEFAULT_IMPORTANT_SIZE,
+        help=f"Text size of important (colored) caption words. Default {DEFAULT_IMPORTANT_SIZE}, "
+             f"allowed {MIN_TEXT_SIZE}-{MAX_TEXT_SIZE}."
+    )
+    parser.add_argument(
+        "--common-size", type=int, default=DEFAULT_COMMON_SIZE,
+        help=f"Text size of common (white) caption words like 'the', 'and'. Default {DEFAULT_COMMON_SIZE}, "
+             f"allowed {MIN_TEXT_SIZE}-{MAX_TEXT_SIZE}."
     )
     args = parser.parse_args()
 
     groq_key = os.environ["GROQ_API_KEY"]
     gem_key = os.environ["GEM_API_KEY"]
+
+    caption_colors = parse_caption_colors(args.caption_colors)
+    important_size = clamp_text_size(args.important_size, DEFAULT_IMPORTANT_SIZE)
+    common_size = clamp_text_size(args.common_size, DEFAULT_COMMON_SIZE)
+    print(f"Caption style - colors: {len(caption_colors)}, important size: {important_size}, common size: {common_size}")
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.output_dir) / f"project_{timestamp}"
@@ -494,7 +555,14 @@ def main():
 
         clip_path = str(out_dir / "captioned.mp4")
         ass_path = str(out_dir / "captions.ass")
-        build_captions_ass(segments, 0, duration, ass_path, title=label, caption_font_family=font_family)
+        build_captions_ass(
+            segments, 0, duration, ass_path,
+            title=label,
+            caption_font_family=font_family,
+            colors=caption_colors,
+            important_size=important_size,
+            common_size=common_size,
+        )
         cut_vertical_clip(
             video_path, 0, duration, clip_path,
             ass_path=ass_path,
@@ -521,7 +589,13 @@ def main():
         for i, clip in enumerate(clips, start=1):
             clip_path = str(out_dir / f"clip_{i}.mp4")
             ass_path = str(out_dir / f"clip_{i}.ass")
-            build_captions_ass(segments, clip["start"], clip["end"], ass_path, title=clip.get("title"))
+            build_captions_ass(
+                segments, clip["start"], clip["end"], ass_path,
+                title=clip.get("title"),
+                colors=caption_colors,
+                important_size=important_size,
+                common_size=common_size,
+            )
             cut_vertical_clip(
                 video_path, clip["start"], clip["end"], clip_path,
                 ass_path=ass_path,
