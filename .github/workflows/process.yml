@@ -14,6 +14,10 @@ on:
         description: "Leave empty to cut clips. Or a language code (en, ur, hi, ar...) to caption the whole video"
         required: false
         default: ""
+      clip_language:
+        description: "Optional caption language for short clips (ur, hi, ar...). Empty = English"
+        required: false
+        default: ""
       caption_colors:
         description: "Optional highlight colors as comma-separated hex, e.g. FFEB3B,00E5FF"
         required: false
@@ -53,6 +57,7 @@ jobs:
           VIDEO_URL: ${{ inputs.video_url }}
           BRAND_TEXT: ${{ inputs.brand_text }}
           CAPTION_ONLY: ${{ inputs.caption_only }}
+          CLIP_LANGUAGE: ${{ inputs.clip_language }}
           CAPTION_COLORS: ${{ inputs.caption_colors }}
           IMPORTANT_SIZE: ${{ inputs.important_size }}
           COMMON_SIZE: ${{ inputs.common_size }}
@@ -63,6 +68,9 @@ jobs:
           fi
           if [ -n "$CAPTION_ONLY" ]; then
             args+=(--caption-only "$CAPTION_ONLY")
+          fi
+          if [ -n "$CLIP_LANGUAGE" ]; then
+            args+=(--clip-language "$CLIP_LANGUAGE")
           fi
           if [ -n "$CAPTION_COLORS" ]; then
             args+=(--caption-colors "$CAPTION_COLORS")
