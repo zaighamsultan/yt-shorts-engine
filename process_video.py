@@ -446,7 +446,7 @@ def main():
     parser.add_argument("--max-clips", type=int, default=6)
     parser.add_argument("--brand-text", default=None, help="Optional watermark text shown on every clip")
     parser.add_argument(
-        "--caption-only", default=None,
+        "--caption-only", default='urdu',
         help="Language name or code ('en', 'english', 'urdu', ...). If given, "
              "skips picking multiple clips: captions the WHOLE video in this "
              "language, adds one title label, and converts to 9:16 - no clip splitting."
