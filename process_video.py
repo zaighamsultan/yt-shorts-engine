@@ -114,6 +114,43 @@ def get_video_duration(video_path: str) -> float:
     return float(result.stdout.strip())
 
 
+def transliterate_segments_to_latin(segments: list, api_key: str) -> list:
+    """Rewrite each segment's text using ONLY the English/Latin alphabet
+    (a casual Roman transliteration, like Roman Urdu) instead of its native
+    script, so captions always display in Latin letters regardless of the
+    spoken language. Meaning/sounds are kept, timestamps are untouched."""
+    if not segments:
+        return segments
+
+    client = genai.Client(api_key=api_key)
+    texts = [s.get("text", "") for s in segments]
+    numbered = "\n".join(f"{i}: {t}" for i, t in enumerate(texts))
+
+    prompt = f"""Rewrite each numbered line below using ONLY the English/Latin alphabet -
+a casual Roman transliteration of how it sounds (for example Roman Urdu, Romanized
+Hindi/Arabic, etc). Do NOT translate the meaning into English and do NOT use any
+native-script characters (no Urdu, Arabic, Devanagari, etc) anywhere in the output.
+Keep the same line numbers and the same number of lines.
+
+Lines:
+{numbered}
+
+Reply with ONLY a JSON object mapping each line number (as a string) to its
+transliterated text. No other text, no markdown fences. Example:
+{{"0": "...", "1": "..."}}
+"""
+    response = client.models.generate_content(model="gemini-3.1-flash-lite", contents=prompt)
+    text = response.text.strip().replace("```json", "").replace("```", "").strip()
+    mapping = json.loads(text)
+
+    new_segments = []
+    for i, seg in enumerate(segments):
+        new_seg = dict(seg)
+        new_seg["text"] = mapping.get(str(i), seg.get("text", ""))
+        new_segments.append(new_seg)
+    return new_segments
+
+
 def pick_clips(transcript: dict, api_key: str, min_clips: int, max_clips: int) -> list:
     """Ask Gemini which segments make good short clips."""
     client = genai.Client(api_key=api_key)
@@ -125,7 +162,9 @@ def pick_clips(transcript: dict, api_key: str, min_clips: int, max_clips: int) -
 
     prompt = f"""You are picking short, engaging clips (15-60 seconds each) from a video transcript
 for YouTube Shorts / TikTok / Reels. Pick between {min_clips} and {max_clips} clips.
-Write each title in the same language as the transcript.
+Write each title using ONLY the English/Latin alphabet (a Roman transliteration if the
+transcript isn't in English) - never native-script characters such as Urdu, Arabic, or
+Devanagari letters.
 
 Transcript with timestamps:
 {transcript_text}
@@ -150,6 +189,8 @@ def pick_label(transcript: dict, api_key: str) -> str:
     transcript_text = "\n".join(s["text"] for s in segments)
 
     prompt = f"""Give one short, catchy title (under 10 words) that describes what this video is about.
+Write it using ONLY the English/Latin alphabet (a Roman transliteration if needed) -
+never native-script characters such as Urdu, Arabic, or Devanagari letters.
 
 Transcript:
 {transcript_text}
@@ -367,6 +408,9 @@ def ffmpeg_path_forward_slashes(path: str) -> str:
 FONT_PATH = prepare_local_font()
 
 # --- Right-to-left / Urdu-Arabic script caption font support ---
+# NOTE: captions are now always transliterated to Latin letters (see
+# transliterate_segments_to_latin), so this RTL font path is kept for
+# reference / future use but is no longer actively selected.
 
 RTL_LANGUAGES = {"ur", "ar", "fa", "ps"}
 
@@ -387,10 +431,9 @@ RTL_FONT_CANDIDATES = [
 
 def resolve_caption_font(lang_code: str):
     """Pick the right font FILE and FAMILY NAME for the caption language.
-    Latin languages use the usual bold font; Urdu/Arabic/Farsi/Pashto need a
-    script that actually contains Arabic-script glyphs, copied into a local
-    fonts/ folder so libass (via ffmpeg's subtitles filter) can find it by
-    name using the fontsdir option."""
+    Captions are always transliterated to Latin now, so this always takes
+    the default Latin-font path in practice regardless of lang_code - the
+    RTL branch is kept here only for reference / future use."""
     fonts_dir = "fonts"
     os.makedirs(fonts_dir, exist_ok=True)
 
@@ -545,8 +588,14 @@ def main():
 
         if lang_code == "en":
             transcript = transcribe_english(audio_path, groq_key)
+            caption_segments = transcript.get("segments", [])
         else:
             transcript = transcribe_in_language(audio_path, groq_key, lang_code)
+            with open(out_dir / "transcript_native.json", "w") as f:
+                json.dump(transcript, f, indent=2)
+            print("Transliterating captions to Latin/English letters...")
+            caption_segments = transliterate_segments_to_latin(transcript.get("segments", []), gem_key)
+
         with open(out_dir / "transcript.json", "w") as f:
             json.dump(transcript, f, indent=2)
 
@@ -555,16 +604,15 @@ def main():
         with open(out_dir / "label.json", "w") as f:
             json.dump({"title": label}, f, indent=2)
 
-        segments = transcript.get("segments", [])
         duration = get_video_duration(video_path)
 
-        fonts_dir, font_family = resolve_caption_font(lang_code)
+        fonts_dir, font_family = resolve_caption_font("en")  # always Latin font now
         print(f"Caption font: {font_family}")
 
         clip_path = str(out_dir / "captioned.mp4")
         ass_path = str(out_dir / "captions.ass")
         build_captions_ass(
-            segments, 0, duration, ass_path,
+            caption_segments, 0, duration, ass_path,
             title=label,
             caption_font_family=font_family,
             colors=caption_colors,
@@ -587,11 +635,17 @@ def main():
         print("Transcribing with Groq...")
         if clip_lang == "en":
             transcript = transcribe_english(audio_path, groq_key)
-            clip_fonts_dir, clip_font_family = None, "DejaVu Sans"
+            caption_segments = transcript.get("segments", [])
         else:
             transcript = transcribe_in_language(audio_path, groq_key, clip_lang)
-            clip_fonts_dir, clip_font_family = resolve_caption_font(clip_lang)
-            print(f"Caption font: {clip_font_family}")
+            with open(out_dir / "transcript_native.json", "w") as f:
+                json.dump(transcript, f, indent=2)
+            print("Transliterating captions to Latin/English letters...")
+            caption_segments = transliterate_segments_to_latin(transcript.get("segments", []), gem_key)
+
+        clip_fonts_dir, clip_font_family = resolve_caption_font("en")  # always Latin font now
+        print(f"Caption font: {clip_font_family}")
+
         with open(out_dir / "transcript.json", "w") as f:
             json.dump(transcript, f, indent=2)
 
@@ -600,14 +654,12 @@ def main():
         with open(out_dir / "clips_metadata.json", "w") as f:
             json.dump(clips, f, indent=2)
 
-        segments = transcript.get("segments", [])
-
         print(f"Cutting {len(clips)} clips...")
         for i, clip in enumerate(clips, start=1):
             clip_path = str(out_dir / f"clip_{i}.mp4")
             ass_path = str(out_dir / f"clip_{i}.ass")
             build_captions_ass(
-                segments, clip["start"], clip["end"], ass_path,
+                caption_segments, clip["start"], clip["end"], ass_path,
                 title=clip.get("title"),
                 caption_font_family=clip_font_family,
                 colors=caption_colors,
