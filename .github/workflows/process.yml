@@ -35,6 +35,10 @@ on:
         description: "Optional text size of common words (40-140)"
         required: false
         default: ""
+      caption_style:
+        description: "Caption look: empty/classic = bottom captions, behind = big captions behind the person"
+        required: false
+        default: ""
 
 jobs:
   process:
@@ -52,19 +56,11 @@ jobs:
       - name: Installing video tools and fonts
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core fonts-noto-core
+          sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core fonts-noto-core libgl1
           pip install -r requirements.txt
 
       - name: Waiting for your turn
         run: sleep $((RANDOM % 20))
-
-      - name: Writing YouTube cookies file (if provided)
-        env:
-          YT_COOKIES: ${{ secrets.YT_COOKIES }}
-        run: |
-          if [ -n "$YT_COOKIES" ]; then
-            echo "$YT_COOKIES" > cookies.txt
-          fi
 
       - name: Creating your video
         env:
@@ -77,6 +73,7 @@ jobs:
           CAPTION_COLORS: ${{ inputs.caption_colors }}
           IMPORTANT_SIZE: ${{ inputs.important_size }}
           COMMON_SIZE: ${{ inputs.common_size }}
+          CAPTION_STYLE: ${{ inputs.caption_style }}
         run: |
           args=(--video "$VIDEO_URL")
           if [ -n "$BRAND_TEXT" ]; then
@@ -96,6 +93,9 @@ jobs:
           fi
           if [ -n "$COMMON_SIZE" ]; then
             args+=(--common-size "$COMMON_SIZE")
+          fi
+          if [ -n "$CAPTION_STYLE" ]; then
+            args+=(--caption-style "$CAPTION_STYLE")
           fi
           python process_video.py "${args[@]}"
 
