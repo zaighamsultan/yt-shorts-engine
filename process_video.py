@@ -371,15 +371,17 @@ FONT_PATH = prepare_local_font()
 RTL_LANGUAGES = {"ur", "ar", "fa", "ps"}
 
 # (file path, font family name libass should look it up by)
+# NOTE: Noto Nastaliq Urdu is deliberately LAST. With ffmpeg's libass it draws empty
+# boxes instead of Urdu letters, while Noto Sans Arabic / Naskh render Urdu correctly.
 RTL_FONT_CANDIDATES = [
-    ("/usr/share/fonts/truetype/noto/NotoNastaliqUrdu-Regular.ttf", "Noto Nastaliq Urdu"),
-    ("/usr/share/fonts/truetype/noto/NotoNastaliqUrdu-Bold.ttf", "Noto Nastaliq Urdu"),
     ("/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf", "Noto Sans Arabic"),
     ("/usr/share/fonts/truetype/noto/NotoNaskhArabic-Bold.ttf", "Noto Naskh Arabic"),
-    ("C:/Windows/Fonts/Urdu Typesetting.ttf", "Urdu Typesetting"),
-    ("C:/Windows/Fonts/arabtype.ttf", "Arabic Typesetting"),
     ("C:/Windows/Fonts/tahomabd.ttf", "Tahoma"),
     ("C:/Windows/Fonts/tahoma.ttf", "Tahoma"),
+    ("C:/Windows/Fonts/Urdu Typesetting.ttf", "Urdu Typesetting"),
+    ("C:/Windows/Fonts/arabtype.ttf", "Arabic Typesetting"),
+    ("/usr/share/fonts/truetype/noto/NotoNastaliqUrdu-Bold.ttf", "Noto Nastaliq Urdu"),
+    ("/usr/share/fonts/truetype/noto/NotoNastaliqUrdu-Regular.ttf", "Noto Nastaliq Urdu"),
 ]
 
 
@@ -401,9 +403,8 @@ def resolve_caption_font(lang_code: str):
                 return fonts_dir, family
         print(
             "WARNING: no Urdu/Arabic-capable font found on this system. "
-            "Captions may show broken boxes. On Linux install 'fonts-noto-core' "
-            "and 'fonts-noto-extra'; on Windows a font like 'Urdu Typesetting' "
-            "or 'Tahoma' is needed."
+            "Captions may show broken boxes. On Linux install 'fonts-noto-core'; "
+            "on Windows a font like 'Tahoma' is needed."
         )
 
     # Default: Latin font, already copied by prepare_local_font()
