@@ -1,4 +1,5 @@
 name: Process Video
+run-name: yts-${{ inputs.request_id }}
 
 on:
   workflow_dispatch:
@@ -8,6 +9,10 @@ on:
         required: true
       brand_text:
         description: "Optional watermark text"
+        required: false
+        default: ""
+      request_id:
+        description: "Internal ID used by the WordPress plugin to find this run"
         required: false
         default: ""
       caption_only:
@@ -49,6 +54,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core fonts-noto-core
           pip install -r requirements.txt
+
+      - name: Waiting for your turn
+        run: sleep $((RANDOM % 20))
 
       - name: Creating your video
         env:
