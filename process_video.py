@@ -21,39 +21,15 @@ from groq import Groq
 from google import genai
 
 
-def is_youtube_url(url: str) -> bool:
-    return "youtube.com" in url or "youtu.be" in url
-
-
 def download_video(source: str, out_path: str) -> str:
-    """Get the video to a local path.
-    - A YouTube link is downloaded with yt-dlp. It uses cookies.txt (a real
-      logged-in browser session) if present, since YouTube blocks most plain
-      requests from data-center IPs like GitHub Actions; otherwise it falls
-      back to an Android client fingerprint, which works some of the time.
-    - Any other URL (a direct video file link, e.g. Google Drive export) is
-      downloaded as-is, exactly as before.
-    - A local path (not a URL) is just copied, for running on your PC."""
+    """Get the video to a local path. Downloads it if source is a URL,
+    otherwise copies it (for running locally with a file on your PC)."""
     if source.startswith("http://") or source.startswith("https://"):
-        if is_youtube_url(source):
-            cmd = ["yt-dlp", "-f", "mp4", "-o", out_path]
-            if os.path.exists("cookies.txt") and os.path.getsize("cookies.txt") > 0:
-                cmd += ["--cookies", "cookies.txt"]
-            else:
-                cmd += [
-                    "--extractor-args", "youtube:player_client=android",
-                    "--user-agent",
-                    "Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/122.0 Mobile Safari/537.36",
-                ]
-            cmd.append(source)
-            subprocess.run(cmd, check=True)
-        else:
-            response = requests.get(source, stream=True, timeout=120)
-            response.raise_for_status()
-            with open(out_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
+        response = requests.get(source, stream=True, timeout=120)
+        response.raise_for_status()
+        with open(out_path, "wb") as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
     else:
         shutil.copy(source, out_path)
     return out_path
@@ -257,6 +233,21 @@ DEFAULT_COMMON_SIZE = 64      # common words like "the", "and", "in"
 MIN_TEXT_SIZE = 40
 MAX_TEXT_SIZE = 140
 
+# Caption look: "classic" = captions at the bottom (original look),
+# "behind" = big captions placed in the middle of the video that appear
+# BEHIND the person (the person is cut out and drawn over the text).
+CAPTION_STYLES = ("classic", "behind")
+BEHIND_IMPORTANT_SIZE = 130   # default sizes for the "behind" look (bigger text)
+BEHIND_COMMON_SIZE = 72       # size of the normal caption line at the bottom in the "behind" look
+BOTTOM_WORDS_PER_LINE = 5
+# What the bottom line shows in the "behind" look:
+#   "full"      = the whole phrase (important words colored), so it reads naturally
+#   "remaining" = only the words that are NOT shown big behind the person
+BEHIND_BOTTOM_MODE = "full"
+BEHIND_TEXT_Y = 900           # vertical centre of the caption on the 1920px frame
+BEHIND_FPS = 30               # the "behind" look renders at a fixed 30 fps so the mask stays in sync
+MASK_WORK_SIZE = 512          # the person mask is computed at this long-side size, then scaled up
+
 
 def parse_caption_colors(value):
     """Turn 'FFEB3B,00E5FF,#FF4081' into a list of (r, g, b) tuples.
@@ -302,6 +293,131 @@ def sanitize_ass_text(word: str) -> str:
     return word.replace("{", "(").replace("}", ")").replace("\\", "")
 
 
+def _ass_header(caption_font_family: str, important_size: int) -> str:
+    """Shared ASS header with the Default (classic), Behind and Title styles."""
+    return (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        "PlayResX: 1080\n"
+        "PlayResY: 1920\n"
+        "WrapStyle: 0\n\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Default,{caption_font_family},{important_size},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
+        "-1,0,0,0,100,100,0,0,1,3,0,2,10,10,250,1\n"
+        f"Style: Behind,{caption_font_family},{important_size},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
+        "-1,0,0,0,100,100,0,0,1,4,0,5,60,60,0,1\n"
+        "Style: Title,DejaVu Sans,52,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
+        "-1,0,0,0,100,100,0,0,1,4,0,8,40,40,90,1\n\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    )
+
+
+def _is_common_word(word: str) -> bool:
+    return word.strip(".,!?;:\"'").lower() in STOPWORDS
+
+
+def build_behind_ass(
+    segments: list,
+    clip_start: float,
+    clip_end: float,
+    behind_ass_path: str,
+    front_ass_path: str,
+    title: str = None,
+    title_duration: float = 2.5,
+    caption_font_family: str = "DejaVu Sans",
+    colors: list = None,
+    important_size: int = BEHIND_IMPORTANT_SIZE,
+    common_size: int = BEHIND_COMMON_SIZE,
+):
+    """'Behind the person' look, written as TWO subtitle files:
+      behind_ass_path - each important word, BIG, in the middle of the frame.
+                        It is drawn under the person cut-out.
+      front_ass_path  - the title at the top and the normal caption line at the
+                        bottom. It is drawn on top of everything."""
+    palette = colors or WORD_COLORS
+
+    chunks = []  # (start, end, words) relative to the clip
+    for seg in segments:
+        if not (seg["end"] > clip_start and seg["start"] < clip_end):
+            continue
+        seg_start = max(seg["start"], clip_start)
+        seg_end = min(seg["end"], clip_end)
+        words = seg["text"].strip().split()
+        if not words:
+            continue
+        n_chunks = max(1, -(-len(words) // BOTTOM_WORDS_PER_LINE))
+        chunk_duration = (seg_end - seg_start) / n_chunks
+        for chunk_idx, i in enumerate(range(0, len(words), BOTTOM_WORDS_PER_LINE)):
+            c_start = max(0, seg_start + chunk_idx * chunk_duration - clip_start)
+            chunks.append((c_start, c_start + chunk_duration, words[i:i + BOTTOM_WORDS_PER_LINE]))
+
+    header = _ass_header(caption_font_family, important_size)
+    behind_lines, front_lines = [], []
+
+    if title:
+        front_lines.append(
+            f"Dialogue: 1,{format_ass_time(0)},{format_ass_time(title_duration)},Title,,0,0,0,,"
+            f"{sanitize_ass_text(title)}"
+        )
+
+    color_i = 0
+    for start, end, words in chunks:
+        n = len(words)
+        word_dur = (end - start) / n
+        important = [k for k, w in enumerate(words) if not _is_common_word(w)]
+
+        # color of each important word (same color behind and at the bottom)
+        word_color = {}
+        for k in important:
+            word_color[k] = palette[color_i % len(palette)]
+            color_i += 1
+
+        # 1) big important words, one at a time, in the order they are spoken
+        for pos, k in enumerate(important):
+            t0 = start if pos == 0 else start + k * word_dur  # first keyword shows right away
+            t1 = start + important[pos + 1] * word_dur if pos + 1 < len(important) else end
+            clean = words[k].strip(".,!?;:\"'")
+            if not clean:
+                continue
+            safe_w = sanitize_ass_text(clean.upper())
+            # shrink very long words so they stay inside the 1080px frame
+            fs = max(60, min(important_size, int(940 / (len(safe_w) * 0.78))))
+            r, g, b = word_color[k]
+            behind_lines.append(
+                f"Dialogue: 0,{format_ass_time(t0)},{format_ass_time(t1)},Behind,,0,0,0,,"
+                f"{{\\an5\\pos(540,{BEHIND_TEXT_Y})\\fs{fs}{rgb_to_ass_inline(r, g, b)}}}{safe_w}"
+            )
+
+        # 2) normal caption line at the bottom
+        parts = []
+        for k, w in enumerate(words):
+            if k in word_color:
+                if BEHIND_BOTTOM_MODE == "remaining":
+                    continue
+                r, g, b = word_color[k]
+            else:
+                r, g, b = 255, 255, 255
+            parts.append(f"{{{rgb_to_ass_inline(r, g, b)}\\fs{common_size}}}{sanitize_ass_text(w)}")
+        if parts:
+            front_lines.append(
+                f"Dialogue: 0,{format_ass_time(start)},{format_ass_time(end)},Default,,0,0,0,,"
+                + " ".join(parts)
+            )
+
+    with open(behind_ass_path, "w", encoding="utf-8") as f:
+        f.write(header)
+        f.write("\n".join(behind_lines))
+        f.write("\n")
+    with open(front_ass_path, "w", encoding="utf-8") as f:
+        f.write(header)
+        f.write("\n".join(front_lines))
+        f.write("\n")
+
+
 def build_captions_ass(
     segments: list,
     clip_start: float,
@@ -342,22 +458,7 @@ def build_captions_ass(
             c_end = c_start + chunk_duration
             lines.append((max(0, c_start), c_end, chunk_words))
 
-    header = (
-        "[Script Info]\n"
-        "ScriptType: v4.00+\n"
-        "PlayResX: 1080\n"
-        "PlayResY: 1920\n\n"
-        "[V4+ Styles]\n"
-        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
-        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
-        "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Default,{caption_font_family},{important_size},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
-        "-1,0,0,0,100,100,0,0,1,3,0,2,10,10,250,1\n"
-        "Style: Title,DejaVu Sans,52,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
-        "-1,0,0,0,100,100,0,0,1,4,0,8,40,40,90,1\n\n"
-        "[Events]\n"
-        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
-    )
+    header = _ass_header(caption_font_family, important_size)
 
     dialogue_lines = []
 
@@ -483,6 +584,97 @@ def resolve_caption_font(lang_code: str):
     return fonts_dir, family
 
 
+def probe_fit_geometry(video_path: str):
+    """Return (fg_w, fg_h): the size the original video has after being fitted
+    inside the 1080x1920 frame (same logic as the foreground in cut_vertical_clip)."""
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height,sample_aspect_ratio",
+            "-of", "json", video_path,
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    stream = json.loads(result.stdout)["streams"][0]
+    w, h = int(stream["width"]), int(stream["height"])
+    sar = stream.get("sample_aspect_ratio") or "1:1"
+    try:
+        num, den = (float(x) for x in sar.split(":"))
+        sar_value = num / den if num > 0 and den > 0 else 1.0
+    except ValueError:
+        sar_value = 1.0
+    disp_w = max(2, int(w * sar_value) // 2 * 2)
+    scale = min(1080 / disp_w, 1920 / h)
+    fg_w = max(2, int(disp_w * scale) // 2 * 2)
+    fg_h = max(2, int(h * scale) // 2 * 2)
+    return fg_w, fg_h
+
+
+def generate_person_mask_video(
+    video_path: str, start: float, duration: float,
+    fg_w: int, fg_h: int, mask_path: str,
+) -> str:
+    """Make a black/white video where white = the person (found with MediaPipe
+    selfie segmentation) for one clip. Works on a small copy of the frames for
+    speed; the mask is scaled up to the full size later. It covers the same
+    time range as the clip, at BEHIND_FPS."""
+    import numpy as np
+    import mediapipe as mp
+
+    k = MASK_WORK_SIZE / max(fg_w, fg_h)
+    mw = max(2, int(fg_w * k) // 2 * 2)
+    mh = max(2, int(fg_h * k) // 2 * 2)
+
+    segmenter = mp.solutions.selfie_segmentation.SelfieSegmentation(
+        model_selection=1 if fg_w >= fg_h else 0
+    )
+
+    decoder = subprocess.Popen(
+        [
+            "ffmpeg", "-v", "error",
+            "-ss", str(start), "-t", str(duration), "-i", video_path,
+            "-vf", f"fps={BEHIND_FPS},scale='trunc(iw*sar/2)*2':ih,setsar=1,scale={mw}:{mh}",
+            "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+        ],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    encoder = subprocess.Popen(
+        [
+            "ffmpeg", "-v", "error", "-y",
+            "-f", "rawvideo", "-pix_fmt", "gray", "-s", f"{mw}x{mh}", "-r", str(BEHIND_FPS),
+            "-i", "-", "-c:v", "ffv1", "-pix_fmt", "gray", mask_path,
+        ],
+        stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+
+    frame_bytes = mw * mh * 3
+    smoothed = None
+    frames = 0
+    try:
+        while True:
+            raw = decoder.stdout.read(frame_bytes)
+            if len(raw) < frame_bytes:
+                break
+            frame = np.frombuffer(raw, dtype=np.uint8).reshape(mh, mw, 3)
+            mask = segmenter.process(frame).segmentation_mask
+            # Sharpen the soft edge a little, then average with the previous
+            # frame so the cut-out does not flicker.
+            mask = np.clip((mask - 0.35) / 0.3, 0.0, 1.0)
+            smoothed = mask if smoothed is None else 0.6 * mask + 0.4 * smoothed
+            encoder.stdin.write((smoothed * 255).astype(np.uint8).tobytes())
+            frames += 1
+    finally:
+        decoder.stdout.close()
+        decoder.wait()
+        encoder.stdin.close()
+        encoder.wait()
+        segmenter.close()
+
+    if frames == 0 or encoder.returncode != 0:
+        raise RuntimeError("person mask could not be created")
+    return mask_path
+
+
 def cut_vertical_clip(
     video_path: str,
     start: float,
@@ -491,12 +683,21 @@ def cut_vertical_clip(
     ass_path: str = None,
     brand_text: str = None,
     fonts_dir: str = None,
+    mask_path: str = None,
+    title_ass_path: str = None,
+    fg_size: tuple = None,
 ):
     """Cut a segment into a true 1080x1920 (9:16) clip: the original video
     fitted in the center (no stretching), with a blurred, cropped copy of
     the same video filling the top and bottom. Then burn in the captions
     and an optional small brand watermark."""
     duration = end - start
+    if mask_path and fg_size:
+        _cut_behind_clip(
+            video_path, start, duration, output_path, ass_path, brand_text,
+            fonts_dir, mask_path, title_ass_path, fg_size,
+        )
+        return
     filters = [
         # Fix non-square pixels first, then split into background/foreground
         "[0:v]scale='trunc(iw*sar/2)*2':ih,setsar=1,split=2[bgsrc][fgsrc]",
@@ -547,6 +748,130 @@ def cut_vertical_clip(
     )
 
 
+def _subtitles_filter(ass_path: str, fonts_dir: str = None) -> str:
+    safe_ass_path = ffmpeg_path_forward_slashes(ass_path)
+    if fonts_dir:
+        safe_fonts_dir = ffmpeg_path_forward_slashes(fonts_dir)
+        return f"subtitles='{safe_ass_path}':fontsdir='{safe_fonts_dir}'"
+    return f"subtitles='{safe_ass_path}'"
+
+
+def _cut_behind_clip(
+    video_path, start, duration, output_path, ass_path, brand_text,
+    fonts_dir, mask_path, title_ass_path, fg_size,
+):
+    """9:16 clip where the captions sit BEHIND the person:
+    blurred background -> captions -> person cut-out on top -> title/brand."""
+    fg_w, fg_h = fg_size
+    filters = [
+        f"[0:v]fps={BEHIND_FPS},scale='trunc(iw*sar/2)*2':ih,setsar=1,split=2[bgsrc][fgsrc]",
+        "[bgsrc]scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920,boxblur=25:5,setsar=1[bg]",
+        f"[fgsrc]scale={fg_w}:{fg_h},setsar=1,split=2[fg][fgp]",
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1[base]",
+        # captions are drawn on the scene WITHOUT the person...
+        f"[base]{_subtitles_filter(ass_path, fonts_dir)}[txt]",
+        # ...then the person (video + mask as transparency) is laid back on top
+        f"[1:v]scale={fg_w}:{fg_h},format=gray[m]",
+        "[fgp][m]alphamerge[person]",
+        "[txt][person]overlay=(W-w)/2:(H-h)/2,setsar=1[comp]",
+    ]
+    current = "[comp]"
+
+    if title_ass_path:
+        filters.append(f"{current}{_subtitles_filter(title_ass_path, fonts_dir)}[titled]")
+        current = "[titled]"
+
+    if brand_text:
+        safe_brand = escape_drawtext(brand_text)
+        filters.append(
+            f"{current}drawtext=fontfile={FONT_PATH}:text='{safe_brand}':"
+            "fontsize=28:fontcolor=white@0.85:borderw=2:bordercolor=black@0.6:"
+            "x=w-text_w-30:y=h-60[branded]"
+        )
+        current = "[branded]"
+
+    subprocess.run(
+        [
+            "ffmpeg", "-y",
+            "-ss", str(start), "-t", str(duration), "-i", video_path,
+            "-i", mask_path,
+            "-filter_complex", ";".join(filters),
+            "-map", current,
+            "-map", "0:a?",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-movflags", "+faststart",
+            "-shortest",
+            output_path,
+        ],
+        check=True,
+    )
+
+
+def render_captioned_clip(
+    video_path, start, end, clip_path, ass_path, segments, title,
+    font_family, fonts_dir, colors, important_size, common_size,
+    brand_text, caption_style,
+):
+    """Build captions and render one clip. In the 'behind' look the person is
+    cut out first; if that fails for any reason the clip is still made with
+    the classic bottom captions, so a job never fails because of the effect."""
+    style = caption_style
+    mask_path = None
+    fg_size = None
+    if style == "behind":
+        try:
+            fg_size = probe_fit_geometry(video_path)
+            mask_path = str(Path(clip_path).with_suffix(".mask.mkv"))
+            print("  finding the person in each frame...")
+            generate_person_mask_video(
+                video_path, start, end - start, fg_size[0], fg_size[1], mask_path
+            )
+        except Exception as e:  # missing mediapipe, odd video, etc.
+            print(f"WARNING: behind-the-person captions unavailable ({e}). Using classic captions.")
+            style = "classic"
+            mask_path = None
+
+    front_ass_path = None
+    if style == "behind":
+        front_ass_path = str(Path(ass_path).with_suffix(".front.ass"))
+        build_behind_ass(
+            segments, start, end, ass_path, front_ass_path,
+            title=title,
+            caption_font_family=font_family,
+            colors=colors,
+            important_size=important_size,
+            common_size=common_size,
+        )
+    else:
+        # classic look; if the user asked for 'behind' but it failed, use the
+        # normal default sizes instead of the big behind-look sizes
+        if caption_style == "behind":
+            important_size, common_size = DEFAULT_IMPORTANT_SIZE, DEFAULT_COMMON_SIZE
+        build_captions_ass(
+            segments, start, end, ass_path,
+            title=title,
+            caption_font_family=font_family,
+            colors=colors,
+            important_size=important_size,
+            common_size=common_size,
+        )
+    try:
+        cut_vertical_clip(
+            video_path, start, end, clip_path,
+            ass_path=ass_path,
+            brand_text=brand_text,
+            fonts_dir=fonts_dir,
+            mask_path=mask_path,
+            title_ass_path=front_ass_path,
+            fg_size=fg_size,
+        )
+    finally:
+        if mask_path and os.path.exists(mask_path):
+            os.remove(mask_path)  # keep the output folder small
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--video", required=True, help="Direct URL to the video file (e.g. an uploaded video link) or a local file path")
@@ -573,14 +898,19 @@ def main():
              "Default: yellow, cyan, pink, orange, green, red, purple."
     )
     parser.add_argument(
-        "--important-size", type=int, default=DEFAULT_IMPORTANT_SIZE,
-        help=f"Text size of important (colored) caption words. Default {DEFAULT_IMPORTANT_SIZE}, "
-             f"allowed {MIN_TEXT_SIZE}-{MAX_TEXT_SIZE}."
+        "--important-size", type=int, default=None,
+        help=f"Text size of important (colored) caption words. Default {DEFAULT_IMPORTANT_SIZE} "
+             f"({BEHIND_IMPORTANT_SIZE} in the 'behind' look), allowed {MIN_TEXT_SIZE}-{MAX_TEXT_SIZE}."
     )
     parser.add_argument(
-        "--common-size", type=int, default=DEFAULT_COMMON_SIZE,
-        help=f"Text size of common (white) caption words like 'the', 'and'. Default {DEFAULT_COMMON_SIZE}, "
-             f"allowed {MIN_TEXT_SIZE}-{MAX_TEXT_SIZE}."
+        "--common-size", type=int, default=None,
+        help=f"Text size of common (white) caption words like 'the', 'and'. Default {DEFAULT_COMMON_SIZE} "
+             f"({BEHIND_COMMON_SIZE} in the 'behind' look), allowed {MIN_TEXT_SIZE}-{MAX_TEXT_SIZE}."
+    )
+    parser.add_argument(
+        "--caption-style", default="classic", choices=CAPTION_STYLES,
+        help="'classic' = captions at the bottom (default). 'behind' = important words big in the "
+             "middle, behind the person; the rest of the caption at the bottom."
     )
     args = parser.parse_args()
 
@@ -588,9 +918,14 @@ def main():
     gem_key = os.environ["GEM_API_KEY"]
 
     caption_colors = parse_caption_colors(args.caption_colors)
-    important_size = clamp_text_size(args.important_size, DEFAULT_IMPORTANT_SIZE)
-    common_size = clamp_text_size(args.common_size, DEFAULT_COMMON_SIZE)
-    print(f"Caption style - colors: {len(caption_colors)}, important size: {important_size}, common size: {common_size}")
+    caption_style = args.caption_style if args.caption_style in CAPTION_STYLES else "classic"
+    is_behind = caption_style == "behind"
+    important_size = clamp_text_size(
+        args.important_size, BEHIND_IMPORTANT_SIZE if is_behind else DEFAULT_IMPORTANT_SIZE)
+    common_size = clamp_text_size(
+        args.common_size, BEHIND_COMMON_SIZE if is_behind else DEFAULT_COMMON_SIZE)
+    print(f"Caption style: {caption_style} - colors: {len(caption_colors)}, "
+          f"important size: {important_size}, common size: {common_size}")
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.output_dir) / f"project_{timestamp}"
@@ -635,19 +970,10 @@ def main():
 
         clip_path = str(out_dir / "captioned.mp4")
         ass_path = str(out_dir / "captions.ass")
-        build_captions_ass(
-            caption_segments, 0, duration, ass_path,
-            title=label,
-            caption_font_family=font_family,
-            colors=caption_colors,
-            important_size=important_size,
-            common_size=common_size,
-        )
-        cut_vertical_clip(
-            video_path, 0, duration, clip_path,
-            ass_path=ass_path,
-            brand_text=args.brand_text,
-            fonts_dir=fonts_dir,
+        render_captioned_clip(
+            video_path, 0, duration, clip_path, ass_path, caption_segments, label,
+            font_family, fonts_dir, caption_colors, important_size, common_size,
+            args.brand_text, caption_style,
         )
         print(f"  saved {clip_path} - {label}")
 
@@ -682,19 +1008,11 @@ def main():
         for i, clip in enumerate(clips, start=1):
             clip_path = str(out_dir / f"clip_{i}.mp4")
             ass_path = str(out_dir / f"clip_{i}.ass")
-            build_captions_ass(
-                caption_segments, clip["start"], clip["end"], ass_path,
-                title=clip.get("title"),
-                caption_font_family=clip_font_family,
-                colors=caption_colors,
-                important_size=important_size,
-                common_size=common_size,
-            )
-            cut_vertical_clip(
-                video_path, clip["start"], clip["end"], clip_path,
-                ass_path=ass_path,
-                brand_text=args.brand_text,
-                fonts_dir=clip_fonts_dir,
+            render_captioned_clip(
+                video_path, clip["start"], clip["end"], clip_path, ass_path,
+                caption_segments, clip.get("title"),
+                clip_font_family, clip_fonts_dir, caption_colors, important_size, common_size,
+                args.brand_text, caption_style,
             )
             print(f"  saved {clip_path} - {clip.get('title', '')}")
 
