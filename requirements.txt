@@ -1,4 +1,4 @@
 groq
 google-genai
 requests
-yt-dlp
+mediapipe==0.10.21
