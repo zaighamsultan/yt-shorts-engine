@@ -32,7 +32,7 @@ def download_video(source: str, out_path: str) -> str:
       requests from data-center IPs like GitHub Actions; otherwise it falls
       back to an Android client fingerprint, which works some of the time.
     - Any other URL (a direct video file link, e.g. Google Drive export) is
-      downloaded as-is.
+      downloaded as-is, exactly as before.
     - A local path (not a URL) is just copied, for running on your PC."""
     if source.startswith("http://") or source.startswith("https://"):
         if is_youtube_url(source):
