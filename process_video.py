@@ -21,15 +21,39 @@ from groq import Groq
 from google import genai
 
 
+def is_youtube_url(url: str) -> bool:
+    return "youtube.com" in url or "youtu.be" in url
+
+
 def download_video(source: str, out_path: str) -> str:
-    """Get the video to a local path. Downloads it if source is a URL,
-    otherwise copies it (for running locally with a file on your PC)."""
+    """Get the video to a local path.
+    - A YouTube link is downloaded with yt-dlp. It uses cookies.txt (a real
+      logged-in browser session) if present, since YouTube blocks most plain
+      requests from data-center IPs like GitHub Actions; otherwise it falls
+      back to an Android client fingerprint, which works some of the time.
+    - Any other URL (a direct video file link, e.g. Google Drive export) is
+      downloaded as-is.
+    - A local path (not a URL) is just copied, for running on your PC."""
     if source.startswith("http://") or source.startswith("https://"):
-        response = requests.get(source, stream=True, timeout=120)
-        response.raise_for_status()
-        with open(out_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
+        if is_youtube_url(source):
+            cmd = ["yt-dlp", "-f", "mp4", "-o", out_path]
+            if os.path.exists("cookies.txt") and os.path.getsize("cookies.txt") > 0:
+                cmd += ["--cookies", "cookies.txt"]
+            else:
+                cmd += [
+                    "--extractor-args", "youtube:player_client=android",
+                    "--user-agent",
+                    "Mozilla/5.0 (Linux; Android 10; SM-G973F) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/122.0 Mobile Safari/537.36",
+                ]
+            cmd.append(source)
+            subprocess.run(cmd, check=True)
+        else:
+            response = requests.get(source, stream=True, timeout=120)
+            response.raise_for_status()
+            with open(out_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
     else:
         shutil.copy(source, out_path)
     return out_path
