@@ -238,13 +238,15 @@ MAX_TEXT_SIZE = 140
 # BEHIND the person (the person is cut out and drawn over the text).
 CAPTION_STYLES = ("classic", "behind")
 BEHIND_IMPORTANT_SIZE = 130   # default sizes for the "behind" look (bigger text)
-BEHIND_COMMON_SIZE = 72       # size of the normal caption line at the bottom in the "behind" look
+BEHIND_COMMON_SIZE = 64       # size of the normal caption line at the bottom in the "behind" look
 BOTTOM_WORDS_PER_LINE = 5
 # What the bottom line shows in the "behind" look:
 #   "full"      = the whole phrase (important words colored), so it reads naturally
 #   "remaining" = only the words that are NOT shown big behind the person
-BEHIND_BOTTOM_MODE = "full"
-BEHIND_TEXT_Y = 900           # vertical centre of the caption on the 1920px frame
+BEHIND_BOTTOM_MODE = "remaining"
+BEHIND_TEXT_Y = 900           # fallback vertical centre when no person/head is found
+BEHIND_HEAD_OVERLAP = 0.35    # how much of the big word's height tucks behind the head (0 = none, 0.5 = half)
+BEHIND_MIN_Y = 240            # keep the big word below the title area
 BEHIND_FPS = 30               # the "behind" look renders at a fixed 30 fps so the mask stays in sync
 MASK_WORK_SIZE = 512          # the person mask is computed at this long-side size, then scaled up
 
@@ -332,6 +334,7 @@ def build_behind_ass(
     colors: list = None,
     important_size: int = BEHIND_IMPORTANT_SIZE,
     common_size: int = BEHIND_COMMON_SIZE,
+    head_y_at=None,
 ):
     """'Behind the person' look, written as TWO subtitle files:
       behind_ass_path - each important word, BIG, in the middle of the frame.
@@ -339,6 +342,7 @@ def build_behind_ass(
       front_ass_path  - the title at the top and the normal caption line at the
                         bottom. It is drawn on top of everything."""
     palette = colors or WORD_COLORS
+    clip_start_offset = 0.0  # head_y_at() works in clip time (0 = first frame of the clip)
 
     chunks = []  # (start, end, words) relative to the clip
     for seg in segments:
@@ -387,9 +391,18 @@ def build_behind_ass(
             # shrink very long words so they stay inside the 1080px frame
             fs = max(60, min(important_size, int(940 / (len(safe_w) * 0.78))))
             r, g, b = word_color[k]
+            # Put the word just above the head so it can be read; only its
+            # lower part goes behind the head and shoulders.
+            text_y = BEHIND_TEXT_Y
+            if head_y_at is not None:
+                head_y = head_y_at(t0 + clip_start_offset, t1 + clip_start_offset)
+                if head_y is not None:
+                    text_y = int(head_y - fs * (0.5 - BEHIND_HEAD_OVERLAP))
+                    text_y = max(BEHIND_MIN_Y + fs // 2, min(1700, text_y))
             behind_lines.append(
                 f"Dialogue: 0,{format_ass_time(t0)},{format_ass_time(t1)},Behind,,0,0,0,,"
-                f"{{\\an5\\pos(540,{BEHIND_TEXT_Y})\\fs{fs}{rgb_to_ass_inline(r, g, b)}}}{safe_w}"
+                f"{{\\an5\\pos(540,{text_y})\\fs{fs}{rgb_to_ass_inline(r, g, b)}"
+                f"\\fscx85\\fscy85\\t(0,140,\\fscx100\\fscy100)}}{safe_w}"
             )
 
         # 2) normal caption line at the bottom
@@ -613,7 +626,7 @@ def probe_fit_geometry(video_path: str):
 def generate_person_mask_video(
     video_path: str, start: float, duration: float,
     fg_w: int, fg_h: int, mask_path: str,
-) -> str:
+):
     """Make a black/white video where white = the person (found with MediaPipe
     selfie segmentation) for one clip. Works on a small copy of the frames for
     speed; the mask is scaled up to the full size later. It covers the same
@@ -650,6 +663,7 @@ def generate_person_mask_video(
     frame_bytes = mw * mh * 3
     smoothed = None
     frames = 0
+    head_tops = []  # per frame: top of the person as a fraction (0-1) of the video height, or None
     try:
         while True:
             raw = decoder.stdout.read(frame_bytes)
@@ -662,6 +676,9 @@ def generate_person_mask_video(
             mask = np.clip((mask - 0.35) / 0.3, 0.0, 1.0)
             smoothed = mask if smoothed is None else 0.6 * mask + 0.4 * smoothed
             encoder.stdin.write((smoothed * 255).astype(np.uint8).tobytes())
+            # first row where enough of the width is "person" = top of the head
+            rows = np.where((smoothed > 0.5).sum(axis=1) >= max(3, int(mw * 0.04)))[0]
+            head_tops.append(float(rows[0]) / mh if len(rows) else None)
             frames += 1
     finally:
         decoder.stdout.close()
@@ -672,7 +689,7 @@ def generate_person_mask_video(
 
     if frames == 0 or encoder.returncode != 0:
         raise RuntimeError("person mask could not be created")
-    return mask_path
+    return mask_path, head_tops
 
 
 def cut_vertical_clip(
@@ -820,14 +837,27 @@ def render_captioned_clip(
     style = caption_style
     mask_path = None
     fg_size = None
+    head_y_at = None
     if style == "behind":
         try:
             fg_size = probe_fit_geometry(video_path)
             mask_path = str(Path(clip_path).with_suffix(".mask.mkv"))
             print("  finding the person in each frame...")
-            generate_person_mask_video(
+            _, head_tops = generate_person_mask_video(
                 video_path, start, end - start, fg_size[0], fg_size[1], mask_path
             )
+            fg_top = (1920 - fg_size[1]) / 2.0
+
+            def head_y_at(t0, t1):
+                """Median top-of-head (in frame pixels) between two clip times."""
+                i0 = max(0, int(t0 * BEHIND_FPS))
+                i1 = min(len(head_tops), max(i0 + 1, int(t1 * BEHIND_FPS)))
+                vals = sorted(v for v in head_tops[i0:i1] if v is not None)
+                if not vals:
+                    vals = sorted(v for v in head_tops if v is not None)
+                if not vals:
+                    return None
+                return fg_top + vals[len(vals) // 2] * fg_size[1]
         except Exception as e:  # missing mediapipe, odd video, etc.
             print(f"WARNING: behind-the-person captions unavailable ({e}). Using classic captions.")
             style = "classic"
@@ -843,6 +873,7 @@ def render_captioned_clip(
             colors=colors,
             important_size=important_size,
             common_size=common_size,
+            head_y_at=head_y_at,
         )
     else:
         # classic look; if the user asked for 'behind' but it failed, use the
