@@ -247,7 +247,21 @@ BEHIND_BOTTOM_MODE = "remaining"
 # Layout of the "behind" look:
 #   "all_behind" = EVERY word is shown behind the person (no bottom line at all)
 #   "three_zone" = older layout: key words rotate behind/top, small words at the bottom
-BEHIND_LAYOUT = "all_behind"
+BEHIND_LAYOUT = "poster"
+#   "poster"     = mixed layout: small lead-in at the TOP, big key word BEHIND the person,
+#                  medium word + huge bold word IN FRONT, small ending at the BOTTOM.
+#                  Words pop in one by one and stay until the phrase ends.
+POSTER_PHRASE_WORDS = 8        # words per on-screen phrase
+POSTER_TOP_RATIO = 0.50        # text sizes, as a share of the "important" size
+POSTER_MID_RATIO = 0.62
+POSTER_FRONT_RATIO = 1.10
+POSTER_BOTTOM_RATIO = 0.55
+# which zone each key word goes to; the pattern changes from phrase to phrase for variety
+POSTER_PATTERNS = {
+    1: [("behind",), ("front",), ("behind",)],
+    2: [("behind", "front"), ("front", "behind"), ("behind", "mid")],
+    3: [("behind", "mid", "front"), ("mid", "behind", "front"), ("behind", "front", "mid")],
+}
 BEHIND_GROUP_MAX_WORDS = 3     # words shown together on one line behind the person
 BEHIND_GROUP_MAX_CHARS = 14    # ...but never more letters than this (long words get their own line)
 BEHIND_SMALL_RATIO = 0.65      # size of small connecting words (the, is, in) next to a big word
@@ -327,6 +341,183 @@ def _ass_header(caption_font_family: str, important_size: int) -> str:
 
 def _is_common_word(word: str) -> bool:
     return word.strip(".,!?;:\"'").lower() in STOPWORDS
+
+
+def build_poster_ass(
+    segments: list,
+    clip_start: float,
+    clip_end: float,
+    behind_ass_path: str,
+    front_ass_path: str,
+    title: str = None,
+    title_duration: float = 2.5,
+    caption_font_family: str = "DejaVu Sans",
+    colors: list = None,
+    important_size: int = BEHIND_IMPORTANT_SIZE,
+    head_y_at=None,
+    zones: dict = None,
+):
+    """'Poster' look: each phrase is built word by word from pieces placed in zones.
+      top    - small lead-in words (white)
+      behind - a big key word just above the head, UNDER the person cut-out
+      mid    - a medium white italic key word, in front
+      front  - a huge bold key word, in front
+      bottom - small ending words (white)
+    Pieces pop in when they are spoken and stay until the phrase ends.
+      behind_ass_path - only the 'behind' pieces
+      front_ass_path  - the title + all other pieces (drawn on top)."""
+    palette = colors or WORD_COLORS
+    zones = zones or {"top_y": 300, "mid_y": 1100, "bottom_y": 1500}
+    header = _ass_header(caption_font_family, important_size)
+    behind_lines, front_lines = [], []
+
+    if title:
+        front_lines.append(
+            f"Dialogue: 2,{format_ass_time(0)},{format_ass_time(title_duration)},Title,,0,0,0,,"
+            f"{sanitize_ass_text(title)}"
+        )
+
+    def clean(w):
+        return w.strip(".,!?;:\"'")
+
+    base_size = {
+        "top": int(important_size * POSTER_TOP_RATIO),
+        "mid": int(important_size * POSTER_MID_RATIO),
+        "front": int(important_size * POSTER_FRONT_RATIO),
+        "bottom": int(important_size * POSTER_BOTTOM_RATIO),
+        "behind": important_size,
+    }
+
+    # 1) cut the speech into phrases
+    phrases = []  # (start, end, words) in clip time
+    for seg in segments:
+        if not (seg["end"] > clip_start and seg["start"] < clip_end):
+            continue
+        seg_start = max(seg["start"], clip_start)
+        seg_end = min(seg["end"], clip_end)
+        words = [w for w in seg["text"].strip().split() if clean(w)]
+        if not words:
+            continue
+        n_chunks = max(1, -(-len(words) // POSTER_PHRASE_WORDS))
+        chunk_dur = (seg_end - seg_start) / n_chunks
+        for ci, i in enumerate(range(0, len(words), POSTER_PHRASE_WORDS)):
+            c0 = max(0.0, seg_start + ci * chunk_dur - clip_start)
+            phrases.append((c0, c0 + chunk_dur, words[i:i + POSTER_PHRASE_WORDS]))
+
+    key_i = 0
+    for pi, (start, end, words) in enumerate(phrases):
+        word_dur = (end - start) / len(words)
+        keys = [k for k, w in enumerate(words) if not _is_common_word(w)]
+
+        # 2) choose up to 3 "hero" key words; words before them = top, after them = bottom
+        if keys:
+            n_h = min(3, len(keys))
+            hs = (len(keys) - n_h) // 2
+            heroes = keys[hs:hs + n_h]
+        else:
+            heroes = []
+        pattern = POSTER_PATTERNS[len(heroes)][pi % 3] if heroes else ()
+
+        pieces = []  # dicts: zone, first (word index), text
+        if heroes and heroes[0] > 0:
+            pieces.append({"zone": "top", "first": 0, "words": words[:heroes[0]], "prefix": []})
+        for j, hk in enumerate(heroes):
+            prefix = words[heroes[j - 1] + 1:hk] if j > 0 else []
+            first = heroes[j - 1] + 1 if (j > 0 and prefix) else hk
+            pieces.append({"zone": pattern[j], "first": first, "words": [words[hk]], "prefix": prefix})
+        tail_from = heroes[-1] + 1 if heroes else 0
+        if tail_from < len(words):
+            pieces.append({"zone": "bottom", "first": tail_from, "words": words[tail_from:], "prefix": []})
+
+        has_mid = any(pc["zone"] == "mid" for pc in pieces)
+        mid_y = zones["mid_y"]
+        front_y = mid_y + (90 if has_mid else 45)
+        bottom_y = min(1700, max(zones["bottom_y"], front_y + 150))
+
+        def geom(pc):
+            zone = pc["zone"]
+            t0 = start if pc["first"] == 0 or pc is pieces[0] else start + pc["first"] * word_dur
+            is_hero = zone in ("behind", "mid", "front")
+            main = " ".join(clean(w) for w in pc["words"]) if is_hero else " ".join(pc["words"])
+            prefix = " ".join(pc["prefix"])
+            n_chars = len(main) + (len(prefix) * 0.7 + 1 if prefix else 0)
+            fs = max(36, min(base_size[zone], int(940 / (max(1, n_chars) * 0.68))))
+            small_fs = max(32, int(fs * 0.6))
+            return zone, t0, is_hero, main, prefix, fs, small_fs
+
+        # Place the 'behind' word first: the top piece is positioned relative to it.
+        behind_y, behind_in_front, top_y_eff = None, False, zones["top_y"]
+        for pc in pieces:
+            if pc["zone"] != "behind":
+                continue
+            _, bt0, _, _, _, bfs, _ = geom(pc)
+            by, has_head = BEHIND_TEXT_Y, False
+            if head_y_at is not None:
+                hy = head_y_at(bt0, end)
+                if hy is not None:
+                    by, has_head = int(hy - bfs * (0.5 - BEHIND_HEAD_OVERLAP)), True
+            min_y = 230 + bfs // 2
+            if has_head and by < min_y:
+                # no room above the head: draw the word in front so it stays readable
+                behind_in_front = True
+            behind_y = max(min_y, min(1700, by))
+            top_y_eff = max(200, min(zones["top_y"], behind_y - bfs // 2 - int(base_size["top"] * 0.5) - 12))
+
+        for pc in pieces:
+            zone, t0, is_hero, main, prefix, fs, small_fs = geom(pc)
+            t1 = end
+            if t1 - t0 < 0.05:
+                continue
+
+            if zone in ("behind", "front"):
+                r, g, b = palette[key_i % len(palette)]
+                key_i += 1
+                color = rgb_to_ass_inline(r, g, b)
+            else:
+                color = rgb_to_ass_inline(255, 255, 255)
+
+            body = ""
+            if prefix:
+                body += f"{{\\fs{small_fs}{rgb_to_ass_inline(255, 255, 255)}}}{sanitize_ass_text(prefix)} "
+            body += f"{{\\fs{fs}{color}}}{sanitize_ass_text(main)}"
+
+            if zone == "behind":
+                y = behind_y
+                anim = (f"\\an5\\pos(540,{y})\\fad(70,60)"
+                        f"\\fscx80\\fscy80\\t(0,110,\\fscx108\\fscy108)\\t(110,190,\\fscx100\\fscy100)")
+                if behind_in_front:
+                    front_lines.append(
+                        f"Dialogue: 0,{format_ass_time(t0)},{format_ass_time(t1)},Default,,0,0,0,,{{{anim}\\bord5}}{body}")
+                else:
+                    behind_lines.append(
+                        f"Dialogue: 0,{format_ass_time(t0)},{format_ass_time(t1)},Behind,,0,0,0,,{{{anim}}}{body}")
+                continue
+
+            if zone == "top":
+                y = top_y_eff
+                anim = f"\\an5\\move(540,{y - 50},540,{y},0,170)\\fad(90,60)\\bord4"
+                layer = 0
+            elif zone == "mid":
+                y = mid_y
+                anim = f"\\an5\\move(430,{y},540,{y},0,190)\\fad(80,60)\\i1\\bord4"
+                layer = 0
+            elif zone == "front":
+                y = front_y
+                anim = (f"\\an5\\pos(540,{y})\\fad(60,60)\\bord6"
+                        f"\\fscx60\\fscy60\\t(0,120,\\fscx112\\fscy112)\\t(120,200,\\fscx100\\fscy100)")
+                layer = 1
+            else:  # bottom
+                y = bottom_y
+                anim = f"\\an5\\move(540,{y + 40},540,{y},0,160)\\fad(80,60)\\bord4"
+                layer = 0
+            front_lines.append(
+                f"Dialogue: {layer},{format_ass_time(t0)},{format_ass_time(t1)},Default,,0,0,0,,{{{anim}}}{body}")
+
+    for path, lines in ((behind_ass_path, behind_lines), (front_ass_path, front_lines)):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(header)
+            f.write("\n".join(lines))
+            f.write("\n")
 
 
 def build_all_behind_ass(
@@ -979,7 +1170,21 @@ def render_captioned_clip(
     if style == "behind":
         front_ass_path = str(Path(ass_path).with_suffix(".front.ass"))
         fg_top = (1920 - fg_size[1]) / 2.0
-        if BEHIND_LAYOUT == "all_behind":
+        if BEHIND_LAYOUT == "poster":
+            build_poster_ass(
+                segments, start, end, ass_path, front_ass_path,
+                title=title,
+                caption_font_family=font_family,
+                colors=colors,
+                important_size=important_size,
+                head_y_at=head_y_at,
+                zones={
+                    "top_y": int(max(230, fg_top + 0.07 * fg_size[1])),
+                    "mid_y": int(fg_top + 0.62 * fg_size[1]),
+                    "bottom_y": int(fg_top + 0.86 * fg_size[1]),
+                },
+            )
+        elif BEHIND_LAYOUT == "all_behind":
             build_all_behind_ass(
                 segments, start, end, ass_path, front_ass_path,
                 title=title,
