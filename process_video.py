@@ -348,8 +348,9 @@ def _is_common_word(word: str) -> bool:
 # Rows for the "stack" look. Each pattern is a list of rows:
 # (words in the row, text size as a share of the "important" size, layer)
 STACK_GAP = .88          # distance between rows as a share of the text size (smaller = tighter)
-STACK_ATTACH_FRONT = True  # True = front rows sit right under the behind rows (one tight block);
+STACK_ATTACH_FRONT = False  # True = front rows sit right under the behind rows (one tight block);
                            # False = front rows go down to a fixed height lower on the body
+                           # (the fixed "mid_y" zone, ~62% down - below center, not at the very bottom)
 STACK_TOP_FLOOR = 150     # a row never starts higher than this (keeps clear of the title)
 STACK_PATTERNS = {
     "row3":        [(3, 0.80, "behind")],                                    # one row of 3 words
@@ -361,6 +362,10 @@ STACK_PATTERNS = {
     "one":         [(1, 1.20, "behind")],
     "two":         [(2, 1.00, "behind")],
     "one_front":   [(1, 1.30, "front")],
+    # Poster-style: a small row of 3 words up near the top (behind the person),
+    # then ONE big key word tucked just above the head/center (behind), then the
+    # remaining 2 words land below center - a clean, professional poster layout.
+    "poster_3_1_2": [(3, 0.60, "behind"), (1, 1.45, "behind"), (2, 0.85, "front")],
 }
 
 
