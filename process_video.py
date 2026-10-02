@@ -244,6 +244,13 @@ BOTTOM_WORDS_PER_LINE = 5
 #   "full"      = the whole phrase (important words colored), so it reads naturally
 #   "remaining" = only the words that are NOT shown big behind the person
 BEHIND_BOTTOM_MODE = "remaining"
+# Layout of the "behind" look:
+#   "all_behind" = EVERY word is shown behind the person (no bottom line at all)
+#   "three_zone" = older layout: key words rotate behind/top, small words at the bottom
+BEHIND_LAYOUT = "all_behind"
+BEHIND_GROUP_MAX_WORDS = 3     # words shown together on one line behind the person
+BEHIND_GROUP_MAX_CHARS = 14    # ...but never more letters than this (long words get their own line)
+BEHIND_SMALL_RATIO = 0.65      # size of small connecting words (the, is, in) next to a big word
 BEHIND_TEXT_Y = 900           # fallback vertical centre when no person/head is found
 BEHIND_HEAD_OVERLAP = 0.35    # how much of the big word's height tucks behind the head (0 = none, 0.5 = half)
 BEHIND_MIN_Y = 240            # keep the big word below the title area
@@ -320,6 +327,108 @@ def _ass_header(caption_font_family: str, important_size: int) -> str:
 
 def _is_common_word(word: str) -> bool:
     return word.strip(".,!?;:\"'").lower() in STOPWORDS
+
+
+def build_all_behind_ass(
+    segments: list,
+    clip_start: float,
+    clip_end: float,
+    behind_ass_path: str,
+    front_ass_path: str,
+    title: str = None,
+    title_duration: float = 2.5,
+    caption_font_family: str = "DejaVu Sans",
+    colors: list = None,
+    important_size: int = BEHIND_IMPORTANT_SIZE,
+    head_y_at=None,
+):
+    """Every caption word is shown BEHIND the person - there is no bottom line.
+    Short groups of words (up to BEHIND_GROUP_MAX_WORDS) are shown one group at a
+    time as a single centered line just above the head: important words big and
+    colored, small connecting words (the, is, in...) smaller and white.
+      behind_ass_path - the words (drawn under the person cut-out)
+      front_ass_path  - only the title at the top (drawn on top)."""
+    palette = colors or WORD_COLORS
+    header = _ass_header(caption_font_family, important_size)
+    behind_lines, front_lines = [], []
+
+    if title:
+        front_lines.append(
+            f"Dialogue: 1,{format_ass_time(0)},{format_ass_time(title_duration)},Title,,0,0,0,,"
+            f"{sanitize_ass_text(title)}"
+        )
+
+    key_i = 0
+    for seg in segments:
+        if not (seg["end"] > clip_start and seg["start"] < clip_end):
+            continue
+        seg_start = max(seg["start"], clip_start)
+        seg_end = min(seg["end"], clip_end)
+        words = seg["text"].strip().split()
+        words = [w for w in words if w.strip(".,!?;:\"'")]
+        if not words:
+            continue
+        seg_dur = (seg_end - seg_start)
+        word_dur = seg_dur / len(words)
+        seg_t0 = max(0.0, seg_start - clip_start)
+
+        # cut the words into short groups that fit on one line
+        groups, cur, cur_chars = [], [], 0.0
+        for k, w in enumerate(words):
+            clean_len = len(w.strip(".,!?;:\"'"))
+            weight = clean_len * (BEHIND_SMALL_RATIO if _is_common_word(w) else 1.0)
+            if cur and (len(cur) >= BEHIND_GROUP_MAX_WORDS or cur_chars + weight > BEHIND_GROUP_MAX_CHARS):
+                groups.append(cur)
+                cur, cur_chars = [], 0.0
+            cur.append(k)
+            cur_chars += weight
+        if cur:
+            groups.append(cur)
+
+        for gi, idxs in enumerate(groups):
+            t0 = seg_t0 if gi == 0 else seg_t0 + idxs[0] * word_dur
+            t1 = seg_t0 + groups[gi + 1][0] * word_dur if gi + 1 < len(groups) else seg_t0 + seg_dur
+            if t1 - t0 < 0.05:
+                continue
+
+            has_key = any(not _is_common_word(words[k]) for k in idxs)
+            ratio_small = BEHIND_SMALL_RATIO if has_key else 0.85
+            # size so the whole line fits inside ~940px
+            units = sum(
+                len(words[k].strip(".,!?;:\"'")) * (ratio_small if _is_common_word(words[k]) else 1.0)
+                for k in idxs
+            ) + 0.4 * (len(idxs) - 1)
+            fs = max(56, min(important_size, int(940 / (units * 0.78))))
+            small_fs = max(40, int(fs * ratio_small))
+
+            parts = []
+            for k in idxs:
+                clean = sanitize_ass_text(words[k].strip(".,!?;:\"'").upper())
+                if _is_common_word(words[k]):
+                    parts.append(f"{{\\fs{small_fs}{rgb_to_ass_inline(255, 255, 255)}}}{clean}")
+                else:
+                    r, g, b = palette[key_i % len(palette)]
+                    key_i += 1
+                    parts.append(f"{{\\fs{fs}{rgb_to_ass_inline(r, g, b)}}}{clean}")
+
+            text_y = BEHIND_TEXT_Y
+            if head_y_at is not None:
+                head_y = head_y_at(t0, t1)
+                if head_y is not None:
+                    text_y = int(head_y - fs * (0.5 - BEHIND_HEAD_OVERLAP))
+                    text_y = max(BEHIND_MIN_Y + fs // 2, min(1700, text_y))
+
+            behind_lines.append(
+                f"Dialogue: 0,{format_ass_time(t0)},{format_ass_time(t1)},Behind,,0,0,0,,"
+                f"{{\\an5\\pos(540,{text_y})\\fscx85\\fscy85\\t(0,130,\\fscx100\\fscy100)}}"
+                + " ".join(parts)
+            )
+
+    for path, lines in ((behind_ass_path, behind_lines), (front_ass_path, front_lines)):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(header)
+            f.write("\n".join(lines))
+            f.write("\n")
 
 
 def build_behind_ass(
@@ -870,7 +979,17 @@ def render_captioned_clip(
     if style == "behind":
         front_ass_path = str(Path(ass_path).with_suffix(".front.ass"))
         fg_top = (1920 - fg_size[1]) / 2.0
-        build_behind_ass(
+        if BEHIND_LAYOUT == "all_behind":
+            build_all_behind_ass(
+                segments, start, end, ass_path, front_ass_path,
+                title=title,
+                caption_font_family=font_family,
+                colors=colors,
+                important_size=important_size,
+                head_y_at=head_y_at,
+            )
+        else:
+          build_behind_ass(
             segments, start, end, ass_path, front_ass_path,
             caption_font_family=font_family,
             colors=colors,
