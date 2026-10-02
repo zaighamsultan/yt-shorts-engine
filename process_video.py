@@ -363,6 +363,19 @@ STACK_PATTERNS = {
     "one_front":   [(1, 1.30, "front")],
 }
 
+# Which row is the "hero" (biggest) row, cycling every card so the big word
+# moves down the caption block: card 1 -> row 1 big, card 2 -> row 2 big,
+# card 3 -> row 3 big, card 4 -> row 1 big again, and so on.
+# Each entry is a list of rows: (words, size_mult, layer).
+HERO_ROTATION = [
+    # hero = row 1 (first row biggest, next rows smaller)
+    [(1, 1.30, "behind"), (1, 0.80, "front"), (1, 0.65, "front")],
+    # hero = row 2 (middle row biggest)
+    [(1, 0.80, "behind"), (1, 1.30, "front"), (1, 0.65, "front")],
+    # hero = row 3 (last row biggest)
+    [(1, 0.70, "behind"), (1, 0.85, "front"), (1, 1.30, "front")],
+]
+
 
 def build_stack_ass(
     segments: list,
@@ -382,8 +395,10 @@ def build_stack_ass(
     TIGHT rows of text (for example one row of 3 words, or 2 big words and under
     them 1 biggest word). Rows near the head are drawn BEHIND the person, rows
     lower down are drawn in FRONT. Words pop in one by one inside their row.
-    The pattern changes from card to card, picked so the biggest rows get the
-    most important words."""
+
+    The BIGGEST (hero) row rotates every card: card 1 -> top row is biggest,
+    card 2 -> middle row is biggest, card 3 -> bottom row is biggest, then it
+    repeats. That keeps the caption looking fresh and attractive."""
     palette = colors or WORD_COLORS
     zones = zones or {"mid_y": 1100}
     header = _ass_header(caption_font_family, important_size)
@@ -399,7 +414,7 @@ def build_stack_ass(
         return w.strip(".,;:\"'")
 
     key_i = 0
-    prev_pattern = None
+    card_index = 0
     for seg in segments:
         if not (seg["end"] > clip_start and seg["start"] < clip_end):
             continue
@@ -415,22 +430,20 @@ def build_stack_ass(
         while i < len(words):
             remaining = len(words) - i
 
-            # pick the pattern whose big rows land on the most important words
-            best = None
-            for name, rows in STACK_PATTERNS.items():
-                total = sum(n for n, _, _ in rows)
-                if total > remaining:
-                    continue
-                score, pos = 0.15 * total, i
-                for n, ratio, _layer in rows:
-                    for w in words[pos:pos + n]:
-                        score += ratio * (-0.5 if _is_common_word(w) else 1.0)
-                    pos += n
-                if name == prev_pattern:
-                    score -= 1.5  # keep the look changing from card to card
-                if best is None or score > best[0]:
-                    best = (score, name, rows, total)
-            _, prev_pattern, rows, total = best
+            # pick the next pattern from the hero rotation, skipping any that
+            # do not fit in the words we have left
+            rows, total = None, None
+            for offset in range(len(HERO_ROTATION)):
+                candidate = HERO_ROTATION[(card_index + offset) % len(HERO_ROTATION)]
+                c_total = sum(n for n, _, _ in candidate)
+                if c_total <= remaining:
+                    rows, total = candidate, c_total
+                    break
+            if rows is None:
+                # fewer words left than any pattern needs: one row with them all
+                rows = [(remaining, 1.0, "behind")]
+                total = remaining
+            card_index += 1
 
             card_start = seg_t0 + i * word_dur
             card_end = seg_t0 + (i + total) * word_dur
