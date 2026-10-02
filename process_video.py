@@ -347,10 +347,10 @@ def _is_common_word(word: str) -> bool:
 
 # Rows for the "stack" look. Each pattern is a list of rows:
 # (words in the row, text size as a share of the "important" size, layer)
-STACK_GAP = 3.88          # distance between rows as a share of the text size (smaller = tighter)
+STACK_GAP = .88          # distance between rows as a share of the text size (smaller = tighter)
 STACK_ATTACH_FRONT = True  # True = front rows sit right under the behind rows (one tight block);
                            # False = front rows go down to a fixed height lower on the body
-STACK_TOP_FLOOR = 215     # a row never starts higher than this (keeps clear of the title)
+STACK_TOP_FLOOR = 150     # a row never starts higher than this (keeps clear of the title)
 STACK_PATTERNS = {
     "row3":        [(3, 0.80, "behind")],                                    # one row of 3 words
     "two_one":     [(2, 0.95, "behind"), (1, 1.30, "front")],                # 2 big words, then 1 BIGGEST
