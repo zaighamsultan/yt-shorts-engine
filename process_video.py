@@ -245,14 +245,16 @@ BOTTOM_WORDS_PER_LINE = 5
 #   "remaining" = only the words that are NOT shown big behind the person
 BEHIND_BOTTOM_MODE = "remaining"
 # Layout of the "behind" look:
+#   "rows5"      = NEW: 3-5 rows per card, filled top -> bottom at 5 fixed heights
+#                  (just below top, above center, center, below center, above bottom).
+#                  Every important word is BIG and BEHIND the person.
 #   "all_behind" = EVERY word is shown behind the person (no bottom line at all)
 #   "three_zone" = older layout: key words rotate behind/top, small words at the bottom
-BEHIND_LAYOUT = "stack"
 #   "stack"      = tight rows (3 words in a row, or 2 big + 1 biggest under them...),
 #                  upper rows behind the person, lower rows in front. Words pop in one by one.
 #   "poster"     = mixed layout: small lead-in at the TOP, big key word BEHIND the person,
 #                  medium word + huge bold word IN FRONT, small ending at the BOTTOM.
-#                  Words pop in one by one and stay until the phrase ends.
+BEHIND_LAYOUT = "rows5"
 POSTER_PHRASE_WORDS = 8        # words per on-screen phrase
 POSTER_TOP_RATIO = 0.50        # text sizes, as a share of the "important" size
 POSTER_MID_RATIO = 0.62
@@ -343,6 +345,150 @@ def _ass_header(caption_font_family: str, important_size: int) -> str:
 
 def _is_common_word(word: str) -> bool:
     return word.strip(".,!?;:\"'").lower() in STOPWORDS
+
+
+# ============================================================
+# "rows5" look: 3-5 rows per card, top -> bottom, at 5 fixed heights
+# ============================================================
+# The 5 fixed row heights on the 1080x1920 frame (top -> bottom):
+#   row 1 = just below the top (under the title)
+#   row 2 = just above the center
+#   row 3 = center
+#   row 4 = just below the center
+#   row 5 = just above the bottom
+ROWS5_Y = [300, 740, 960, 1180, 1660]
+# 3 words -> rows 1,3,5 | 4 words -> rows 1,2,4,5 | 5 words -> all rows
+ROWS5_SLOTS = {1: [2], 2: [1, 3], 3: [0, 2, 4], 4: [0, 1, 3, 4], 5: [0, 1, 2, 3, 4]}
+ROWS5_COMMON_RATIO = 0.55      # size of small words (the, is, in) next to a big word
+# False = every important word is behind the person (exactly as requested).
+# True  = if a row is far below the head (hidden by the body), draw it in front so it stays readable.
+ROWS5_KEEP_READABLE = False
+
+
+def build_rows5_ass(
+    segments: list,
+    clip_start: float,
+    clip_end: float,
+    behind_ass_path: str,
+    front_ass_path: str,
+    title: str = None,
+    title_duration: float = 2.5,
+    caption_font_family: str = "DejaVu Sans",
+    colors: list = None,
+    important_size: int = BEHIND_IMPORTANT_SIZE,
+    head_y_at=None,
+):
+    """Every card has 3-5 rows, filled from TOP to BOTTOM in speaking order.
+    Each row = one important word, BIG and colored, drawn BEHIND the person
+    (small connecting words like 'the', 'is' sit beside it, small and white).
+    Rows pop in one by one and stay until the card ends."""
+    palette = colors or WORD_COLORS
+    header = _ass_header(caption_font_family, important_size)
+    behind_lines, front_lines = [], []
+
+    if title:
+        front_lines.append(
+            f"Dialogue: 2,{format_ass_time(0)},{format_ass_time(title_duration)},Title,,0,0,0,,"
+            f"{sanitize_ass_text(title)}"
+        )
+
+    def clean(w):
+        return w.strip(".,!?;:\"'")
+
+    key_i = 0
+    for seg in segments:
+        if not (seg["end"] > clip_start and seg["start"] < clip_end):
+            continue
+        seg_start = max(seg["start"], clip_start)
+        seg_end = min(seg["end"], clip_end)
+        words = [w for w in seg["text"].strip().split() if clean(w)]
+        if not words:
+            continue
+        seg_t0 = max(0.0, seg_start - clip_start)
+        word_dur = (seg_end - seg_start) / len(words)
+
+        # 1) one row per important word; small words attach to it
+        rows, prefix = [], []
+        for k, w in enumerate(words):
+            if _is_common_word(w):
+                prefix.append((k, clean(w)))
+            else:
+                rows.append({
+                    "first": prefix[0][0] if prefix else k,
+                    "prefix": " ".join(p for _, p in prefix),
+                    "main": clean(w), "suffix": "", "key": True,
+                })
+                prefix = []
+        if prefix:
+            tail = " ".join(p for _, p in prefix)
+            if rows:
+                rows[-1]["suffix"] = tail
+            else:
+                rows.append({"first": 0, "prefix": "", "main": tail, "suffix": "", "key": False})
+
+        # 2) cut the rows into cards of 3-5 rows (balanced)
+        n = len(rows)
+        n_cards = -(-n // 5)
+        base, extra = divmod(n, n_cards)
+        cards, pos = [], 0
+        for c in range(n_cards):
+            size = base + (1 if c < extra else 0)
+            cards.append(rows[pos:pos + size])
+            pos += size
+
+        for ci, card in enumerate(cards):
+            card_start = seg_t0 + card[0]["first"] * word_dur
+            card_end = (seg_t0 + cards[ci + 1][0]["first"] * word_dur
+                        if ci + 1 < len(cards) else seg_t0 + len(words) * word_dur)
+            slots = ROWS5_SLOTS[len(card)]
+
+            for ri, row in enumerate(card):
+                y = ROWS5_Y[slots[ri]]
+                t0 = card_start if ri == 0 else seg_t0 + row["first"] * word_dur
+                t1 = card_end
+                if t1 - t0 < 0.05:
+                    continue
+
+                small_txt = (row["prefix"] + " " + row["suffix"]).strip()
+                chars = len(row["main"]) + ROWS5_COMMON_RATIO * len(small_txt) + (1 if small_txt else 0)
+                top_size = important_size if row["key"] else int(important_size * 0.55)
+                fs = max(44, min(top_size, int(940 / (chars * 0.62))))
+                small_fs = max(34, int(fs * ROWS5_COMMON_RATIO))
+
+                white = rgb_to_ass_inline(255, 255, 255)
+                if row["key"]:
+                    r, g, b = palette[key_i % len(palette)]
+                    key_i += 1
+                    main_color = rgb_to_ass_inline(r, g, b)
+                else:
+                    main_color = white
+
+                body = ""
+                if row["prefix"]:
+                    body += f"{{\\fs{small_fs}{white}}}{sanitize_ass_text(row['prefix'])} "
+                body += f"{{\\fs{fs}{main_color}}}{sanitize_ass_text(row['main'])}"
+                if row["suffix"]:
+                    body += f" {{\\fs{small_fs}{white}}}{sanitize_ass_text(row['suffix'])}"
+
+                pop = "\\fscx75\\fscy75\\t(0,120,\\fscx108\\fscy108)\\t(120,200,\\fscx100\\fscy100)"
+                tags = f"\\an5\\pos(540,{y})\\fad(60,60)\\bord5{pop}"
+
+                is_behind = row["key"]
+                if is_behind and ROWS5_KEEP_READABLE and head_y_at is not None:
+                    hy = head_y_at(t0, t1)
+                    if hy is not None and y > hy + 350:
+                        is_behind = False
+
+                style = "Behind" if is_behind else "Default"
+                line = (f"Dialogue: 0,{format_ass_time(t0)},{format_ass_time(t1)},{style},,0,0,0,,"
+                        "{" + tags + "}" + body)
+                (behind_lines if is_behind else front_lines).append(line)
+
+    for path, lines in ((behind_ass_path, behind_lines), (front_ass_path, front_lines)):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(header)
+            f.write("\n".join(lines))
+            f.write("\n")
 
 
 # Rows for the "stack" look. Each pattern is a list of rows:
@@ -1390,7 +1536,16 @@ def render_captioned_clip(
         fg_top = (1920 - fg_size[1]) / 2.0
         poster_font_family = ensure_display_font() or font_family
         print(f"  poster caption font: {poster_font_family}")
-        if BEHIND_LAYOUT == "stack":
+        if BEHIND_LAYOUT == "rows5":
+            build_rows5_ass(
+                segments, start, end, ass_path, front_ass_path,
+                title=title,
+                caption_font_family=poster_font_family,
+                colors=colors,
+                important_size=important_size,
+                head_y_at=head_y_at,
+            )
+        elif BEHIND_LAYOUT == "stack":
             build_stack_ass(
                 segments, start, end, ass_path, front_ass_path,
                 title=title,
@@ -1424,18 +1579,18 @@ def render_captioned_clip(
                 head_y_at=head_y_at,
             )
         else:
-          build_behind_ass(
-            segments, start, end, ass_path, front_ass_path,
-            caption_font_family=poster_font_family,
-            colors=colors,
-            important_size=important_size,
-            common_size=common_size,
-            head_y_at=head_y_at,
-            # top word sits above the video (or near its top edge on a full-height video),
-            # small words sit under it (or near the bottom edge on a full-height video)
-            top_y=int(min(520, max(300, fg_top - 120))),
-            bottom_y=int(min(1650, fg_top + fg_size[1] + 230)),
-        )
+            build_behind_ass(
+                segments, start, end, ass_path, front_ass_path,
+                caption_font_family=poster_font_family,
+                colors=colors,
+                important_size=important_size,
+                common_size=common_size,
+                head_y_at=head_y_at,
+                # top word sits above the video (or near its top edge on a full-height video),
+                # small words sit under it (or near the bottom edge on a full-height video)
+                top_y=int(min(520, max(300, fg_top - 120))),
+                bottom_y=int(min(1650, fg_top + fg_size[1] + 230)),
+            )
     else:
         # classic look; if the user asked for 'behind' but it failed, use the
         # normal default sizes instead of the big behind-look sizes
