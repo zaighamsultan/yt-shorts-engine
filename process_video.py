@@ -238,7 +238,7 @@ MAX_TEXT_SIZE = 140
 # BEHIND the person (the person is cut out and drawn over the text).
 CAPTION_STYLES = ("classic", "behind")
 BEHIND_IMPORTANT_SIZE = 130   # default sizes for the "behind" look (bigger text)
-BEHIND_COMMON_SIZE = 64       # size of the normal caption line at the bottom in the "behind" look
+BEHIND_COMMON_SIZE = 84       # size of the normal caption line at the bottom in the "behind" look
 BOTTOM_WORDS_PER_LINE = 5
 # What the bottom line shows in the "behind" look:
 #   "full"      = the whole phrase (important words colored), so it reads naturally
@@ -328,21 +328,26 @@ def build_behind_ass(
     clip_end: float,
     behind_ass_path: str,
     front_ass_path: str,
-    title: str = None,
-    title_duration: float = 2.5,
     caption_font_family: str = "DejaVu Sans",
     colors: list = None,
     important_size: int = BEHIND_IMPORTANT_SIZE,
     common_size: int = BEHIND_COMMON_SIZE,
     head_y_at=None,
+    top_y: int = 420,
+    bottom_y: int = 1500,
 ):
-    """'Behind the person' look, written as TWO subtitle files:
-      behind_ass_path - each important word, BIG, in the middle of the frame.
-                        It is drawn under the person cut-out.
-      front_ass_path  - the title at the top and the normal caption line at the
-                        bottom. It is drawn on top of everything."""
+    """'Animated 3-zone' look, written as TWO subtitle files (no title, no
+    repeated words - every word is shown exactly once):
+
+      behind_ass_path - key words, BIG, just above the head, drawn UNDER the
+                        person cut-out (pop-in animation).
+      front_ass_path  - key words at the TOP (slide-down + fade) and the small
+                        connecting words at the BOTTOM (pop-in), drawn on top.
+
+    Each caption line is cut into short pieces (one key word, or a run of
+    common words). One piece is on screen at a time, and the key words rotate
+    between the behind and top positions."""
     palette = colors or WORD_COLORS
-    clip_start_offset = 0.0  # head_y_at() works in clip time (0 = first frame of the clip)
 
     chunks = []  # (start, end, words) relative to the clip
     for seg in segments:
@@ -361,74 +366,72 @@ def build_behind_ass(
 
     header = _ass_header(caption_font_family, important_size)
     behind_lines, front_lines = [], []
+    key_i = 0
+    top_size = max(60, int(important_size * 0.78))
 
-    if title:
-        front_lines.append(
-            f"Dialogue: 1,{format_ass_time(0)},{format_ass_time(title_duration)},Title,,0,0,0,,"
-            f"{sanitize_ass_text(title)}"
-        )
-
-    color_i = 0
     for start, end, words in chunks:
-        n = len(words)
-        word_dur = (end - start) / n
-        important = [k for k, w in enumerate(words) if not _is_common_word(w)]
+        word_dur = (end - start) / len(words)
 
-        # color of each important word (same color behind and at the bottom)
-        word_color = {}
-        for k in important:
-            word_color[k] = palette[color_i % len(palette)]
-            color_i += 1
+        # cut the line into pieces: one key word, or a run of common words
+        pieces = []  # [kind, [words], first_index]
+        for k, w in enumerate(words):
+            kind = "common" if _is_common_word(w) else "key"
+            if kind == "common" and pieces and pieces[-1][0] == "common":
+                pieces[-1][1].append(w)
+            else:
+                pieces.append([kind, [w], k])
 
-        # 1) big important words, one at a time, in the order they are spoken
-        for pos, k in enumerate(important):
-            t0 = start if pos == 0 else start + k * word_dur  # first keyword shows right away
-            t1 = start + important[pos + 1] * word_dur if pos + 1 < len(important) else end
-            clean = words[k].strip(".,!?;:\"'")
+        for n, (kind, piece_words, first) in enumerate(pieces):
+            t0 = start if n == 0 else start + first * word_dur
+            t1 = start + pieces[n + 1][2] * word_dur if n + 1 < len(pieces) else end
+            if t1 - t0 < 0.05:
+                continue
+            at, to = format_ass_time(t0), format_ass_time(t1)
+
+            if kind == "common":
+                text = sanitize_ass_text(" ".join(piece_words))
+                front_lines.append(
+                    f"Dialogue: 0,{at},{to},Default,,0,0,0,,"
+                    f"{{\\an5\\pos(540,{bottom_y})\\fs{common_size}\\bord5\\fad(70,50)"
+                    f"\\fscx80\\fscy80\\t(0,150,\\fscx100\\fscy100)}}{text}"
+                )
+                continue
+
+            clean = piece_words[0].strip(".,!?;:\"'")
             if not clean:
                 continue
-            safe_w = sanitize_ass_text(clean.upper())
-            # shrink very long words so they stay inside the 1080px frame
-            fs = max(60, min(important_size, int(940 / (len(safe_w) * 0.78))))
-            r, g, b = word_color[k]
-            # Put the word just above the head so it can be read; only its
-            # lower part goes behind the head and shoulders.
-            text_y = BEHIND_TEXT_Y
-            if head_y_at is not None:
-                head_y = head_y_at(t0 + clip_start_offset, t1 + clip_start_offset)
-                if head_y is not None:
-                    text_y = int(head_y - fs * (0.5 - BEHIND_HEAD_OVERLAP))
-                    text_y = max(BEHIND_MIN_Y + fs // 2, min(1700, text_y))
-            behind_lines.append(
-                f"Dialogue: 0,{format_ass_time(t0)},{format_ass_time(t1)},Behind,,0,0,0,,"
-                f"{{\\an5\\pos(540,{text_y})\\fs{fs}{rgb_to_ass_inline(r, g, b)}"
-                f"\\fscx85\\fscy85\\t(0,140,\\fscx100\\fscy100)}}{safe_w}"
-            )
+            r, g, b = palette[key_i % len(palette)]
+            zone = ("behind", "behind", "top")[key_i % 3]
+            key_i += 1
+            word = sanitize_ass_text(clean.upper())
+            color = rgb_to_ass_inline(r, g, b)
 
-        # 2) normal caption line at the bottom
-        parts = []
-        for k, w in enumerate(words):
-            if k in word_color:
-                if BEHIND_BOTTOM_MODE == "remaining":
-                    continue
-                r, g, b = word_color[k]
+            if zone == "top":
+                fs = max(56, min(top_size, int(940 / (len(word) * 0.78))))
+                front_lines.append(
+                    f"Dialogue: 0,{at},{to},Default,,0,0,0,,"
+                    f"{{\\an5\\move(540,{top_y - 70},540,{top_y},0,180)\\fad(90,60)"
+                    f"\\fs{fs}\\bord6{color}}}{word}"
+                )
             else:
-                r, g, b = 255, 255, 255
-            parts.append(f"{{{rgb_to_ass_inline(r, g, b)}\\fs{common_size}}}{sanitize_ass_text(w)}")
-        if parts:
-            front_lines.append(
-                f"Dialogue: 0,{format_ass_time(start)},{format_ass_time(end)},Default,,0,0,0,,"
-                + " ".join(parts)
-            )
+                fs = max(60, min(important_size, int(940 / (len(word) * 0.78))))
+                text_y = BEHIND_TEXT_Y
+                if head_y_at is not None:
+                    head_y = head_y_at(t0, t1)
+                    if head_y is not None:
+                        text_y = int(head_y - fs * (0.5 - BEHIND_HEAD_OVERLAP))
+                        text_y = max(BEHIND_MIN_Y + fs // 2, min(1700, text_y))
+                behind_lines.append(
+                    f"Dialogue: 0,{at},{to},Behind,,0,0,0,,"
+                    f"{{\\an5\\pos(540,{text_y})\\fs{fs}{color}"
+                    f"\\fscx80\\fscy80\\t(0,110,\\fscx108\\fscy108)\\t(110,190,\\fscx100\\fscy100)}}{word}"
+                )
 
-    with open(behind_ass_path, "w", encoding="utf-8") as f:
-        f.write(header)
-        f.write("\n".join(behind_lines))
-        f.write("\n")
-    with open(front_ass_path, "w", encoding="utf-8") as f:
-        f.write(header)
-        f.write("\n".join(front_lines))
-        f.write("\n")
+    for path, lines in ((behind_ass_path, behind_lines), (front_ass_path, front_lines)):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(header)
+            f.write("\n".join(lines))
+            f.write("\n")
 
 
 def build_captions_ass(
@@ -866,14 +869,18 @@ def render_captioned_clip(
     front_ass_path = None
     if style == "behind":
         front_ass_path = str(Path(ass_path).with_suffix(".front.ass"))
+        fg_top = (1920 - fg_size[1]) / 2.0
         build_behind_ass(
             segments, start, end, ass_path, front_ass_path,
-            title=title,
             caption_font_family=font_family,
             colors=colors,
             important_size=important_size,
             common_size=common_size,
             head_y_at=head_y_at,
+            # top word sits above the video (or near its top edge on a full-height video),
+            # small words sit under it (or near the bottom edge on a full-height video)
+            top_y=int(min(520, max(300, fg_top - 120))),
+            bottom_y=int(min(1650, fg_top + fg_size[1] + 230)),
         )
     else:
         # classic look; if the user asked for 'behind' but it failed, use the
