@@ -247,7 +247,9 @@ BEHIND_BOTTOM_MODE = "remaining"
 # Layout of the "behind" look:
 #   "all_behind" = EVERY word is shown behind the person (no bottom line at all)
 #   "three_zone" = older layout: key words rotate behind/top, small words at the bottom
-BEHIND_LAYOUT = "poster"
+BEHIND_LAYOUT = "stack"
+#   "stack"      = tight rows (3 words in a row, or 2 big + 1 biggest under them...),
+#                  upper rows behind the person, lower rows in front. Words pop in one by one.
 #   "poster"     = mixed layout: small lead-in at the TOP, big key word BEHIND the person,
 #                  medium word + huge bold word IN FRONT, small ending at the BOTTOM.
 #                  Words pop in one by one and stay until the phrase ends.
@@ -341,6 +343,189 @@ def _ass_header(caption_font_family: str, important_size: int) -> str:
 
 def _is_common_word(word: str) -> bool:
     return word.strip(".,!?;:\"'").lower() in STOPWORDS
+
+
+# Rows for the "stack" look. Each pattern is a list of rows:
+# (words in the row, text size as a share of the "important" size, layer)
+STACK_GAP = 0.88          # distance between rows as a share of the text size (smaller = tighter)
+STACK_ATTACH_FRONT = True  # True = front rows sit right under the behind rows (one tight block);
+                           # False = front rows go down to a fixed height lower on the body
+STACK_TOP_FLOOR = 215     # a row never starts higher than this (keeps clear of the title)
+STACK_PATTERNS = {
+    "row3":        [(3, 0.80, "behind")],                                    # one row of 3 words
+    "two_one":     [(2, 0.95, "behind"), (1, 1.30, "front")],                # 2 big words, then 1 BIGGEST
+    "three_two":   [(3, 0.70, "behind"), (2, 1.00, "front")],
+    "one_two":     [(1, 1.10, "behind"), (2, 0.90, "front")],
+    "two_one_two": [(2, 0.80, "behind"), (1, 1.30, "front"), (2, 0.65, "front")],
+    "ladder":      [(1, 0.55, "behind"), (1, 1.15, "behind"), (1, 0.95, "front")],
+    "one":         [(1, 1.20, "behind")],
+    "two":         [(2, 1.00, "behind")],
+    "one_front":   [(1, 1.30, "front")],
+}
+
+
+def build_stack_ass(
+    segments: list,
+    clip_start: float,
+    clip_end: float,
+    behind_ass_path: str,
+    front_ass_path: str,
+    title: str = None,
+    title_duration: float = 2.5,
+    caption_font_family: str = "DejaVu Sans",
+    colors: list = None,
+    important_size: int = BEHIND_IMPORTANT_SIZE,
+    head_y_at=None,
+    zones: dict = None,
+):
+    """'Stack' look: the speech is cut into small cards, and every card is a few
+    TIGHT rows of text (for example one row of 3 words, or 2 big words and under
+    them 1 biggest word). Rows near the head are drawn BEHIND the person, rows
+    lower down are drawn in FRONT. Words pop in one by one inside their row.
+    The pattern changes from card to card, picked so the biggest rows get the
+    most important words."""
+    palette = colors or WORD_COLORS
+    zones = zones or {"mid_y": 1100}
+    header = _ass_header(caption_font_family, important_size)
+    behind_lines, front_lines = [], []
+
+    if title:
+        front_lines.append(
+            f"Dialogue: 2,{format_ass_time(0)},{format_ass_time(title_duration)},Title,,0,0,0,,"
+            f"{sanitize_ass_text(title)}"
+        )
+
+    def clean(w):
+        return w.strip(".,;:\"'")
+
+    key_i = 0
+    prev_pattern = None
+    for seg in segments:
+        if not (seg["end"] > clip_start and seg["start"] < clip_end):
+            continue
+        seg_start = max(seg["start"], clip_start)
+        seg_end = min(seg["end"], clip_end)
+        words = [w for w in seg["text"].strip().split() if clean(w)]
+        if not words:
+            continue
+        seg_t0 = max(0.0, seg_start - clip_start)
+        word_dur = (seg_end - seg_start) / len(words)
+
+        i = 0
+        while i < len(words):
+            remaining = len(words) - i
+
+            # pick the pattern whose big rows land on the most important words
+            best = None
+            for name, rows in STACK_PATTERNS.items():
+                total = sum(n for n, _, _ in rows)
+                if total > remaining:
+                    continue
+                score, pos = 0.15 * total, i
+                for n, ratio, _layer in rows:
+                    for w in words[pos:pos + n]:
+                        score += ratio * (-0.5 if _is_common_word(w) else 1.0)
+                    pos += n
+                if name == prev_pattern:
+                    score -= 1.5  # keep the look changing from card to card
+                if best is None or score > best[0]:
+                    best = (score, name, rows, total)
+            _, prev_pattern, rows, total = best
+
+            card_start = seg_t0 + i * word_dur
+            card_end = seg_t0 + (i + total) * word_dur
+
+            built, pos = [], i
+            for n, ratio, layer in rows:
+                raw = words[pos:pos + n]
+                shown = [clean(w) for w in raw]
+                chars = sum(len(x) for x in shown) + (n - 1)
+                fs = max(40, min(int(ratio * important_size), int(960 / (chars * 0.66))))
+                built.append({"raw": raw, "words": shown, "fs": fs, "layer": layer, "first": pos})
+                pos += n
+
+            # --- vertical positions: rows are packed close together ---
+            b_rows = [r for r in built if r["layer"] == "behind"]
+            f_rows = [r for r in built if r["layer"] == "front"]
+            demote = False
+            if b_rows:
+                last = b_rows[-1]
+                by, has_head = BEHIND_TEXT_Y, False
+                if head_y_at is not None:
+                    hy = head_y_at(card_start, card_end)
+                    if hy is not None:
+                        by, has_head = int(hy - last["fs"] * (0.5 - BEHIND_HEAD_OVERLAP)), True
+                last["y"] = by
+                for k in range(len(b_rows) - 2, -1, -1):
+                    cur, nxt = b_rows[k], b_rows[k + 1]
+                    cur["y"] = nxt["y"] - int(STACK_GAP * (cur["fs"] + nxt["fs"]) / 2)
+                top_edge = b_rows[0]["y"] - b_rows[0]["fs"] // 2
+                if top_edge < STACK_TOP_FLOOR:
+                    for r in b_rows:
+                        r["y"] += STACK_TOP_FLOOR - top_edge
+                    # no room above the head: draw these rows in front so they stay readable
+                    demote = has_head
+            if f_rows:
+                min_top = (b_rows[-1]["y"] + b_rows[-1]["fs"] // 2) if b_rows else 0
+                if b_rows and STACK_ATTACH_FRONT:
+                    f_rows[0]["y"] = b_rows[-1]["y"] + int(
+                        STACK_GAP * (b_rows[-1]["fs"] + f_rows[0]["fs"]) / 2)
+                else:
+                    f_rows[0]["y"] = max(zones["mid_y"], min_top + f_rows[0]["fs"] // 2 + 10)
+                for k in range(1, len(f_rows)):
+                    prv, cur = f_rows[k - 1], f_rows[k]
+                    cur["y"] = prv["y"] + int(STACK_GAP * (prv["fs"] + cur["fs"]) / 2)
+                excess = f_rows[-1]["y"] + f_rows[-1]["fs"] // 2 - 1780
+                if excess > 0:
+                    for r in f_rows:
+                        r["y"] -= excess
+
+            # --- events: words appear one by one inside each row ---
+            biggest = max(r["fs"] for r in built)
+            for r in built:
+                is_behind = r["layer"] == "behind" and not demote
+                n = len(r["words"])
+                word_colors = []
+                for w in r["raw"]:
+                    if _is_common_word(w):
+                        word_colors.append((255, 255, 255))
+                    else:
+                        word_colors.append(palette[key_i % len(palette)])
+                        key_i += 1
+                layer = 1 if (r["layer"] == "front" and r["fs"] == biggest) else 0
+                bord = 4 if is_behind else 5
+                for j in range(n):
+                    e0 = seg_t0 + (r["first"] + j) * word_dur
+                    e1 = seg_t0 + (r["first"] + j + 1) * word_dur if j < n - 1 else card_end
+                    if e1 - e0 < 0.04:
+                        continue
+                    parts = []
+                    for k, wtxt in enumerate(r["words"]):
+                        safe = sanitize_ass_text(wtxt)
+                        if k > j:
+                            parts.append("{\\alpha&HFF&}" + safe)  # not spoken yet: invisible, keeps its place
+                        else:
+                            cr, cg, cb = word_colors[k]
+                            if k == j:
+                                pop = "\\fscx78\\fscy78\\t(0,130,\\fscx106\\fscy106)\\t(130,200,\\fscx100\\fscy100)"
+                            else:
+                                pop = "\\fscx100\\fscy100"
+                            parts.append("{\\alpha&H00&" + rgb_to_ass_inline(cr, cg, cb) + pop + "}" + safe)
+                    fade_in = 40 if j == 0 else 0
+                    fade_out = 60 if j == n - 1 else 0
+                    fad = f"\\fad({fade_in},{fade_out})" if (fade_in or fade_out) else ""
+                    tags = f"\\an5\\pos(540,{r['y']})\\fs{r['fs']}\\bord{bord}{fad}"
+                    style = "Behind" if is_behind else "Default"
+                    line = (f"Dialogue: {layer},{format_ass_time(e0)},{format_ass_time(e1)},{style},,0,0,0,,"
+                            + "{" + tags + "}" + " ".join(parts))
+                    (behind_lines if is_behind else front_lines).append(line)
+            i += total
+
+    for path, lines in ((behind_ass_path, behind_lines), (front_ass_path, front_lines)):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(header)
+            f.write("\n".join(lines))
+            f.write("\n")
 
 
 def build_poster_ass(
@@ -1170,7 +1355,17 @@ def render_captioned_clip(
     if style == "behind":
         front_ass_path = str(Path(ass_path).with_suffix(".front.ass"))
         fg_top = (1920 - fg_size[1]) / 2.0
-        if BEHIND_LAYOUT == "poster":
+        if BEHIND_LAYOUT == "stack":
+            build_stack_ass(
+                segments, start, end, ass_path, front_ass_path,
+                title=title,
+                caption_font_family=font_family,
+                colors=colors,
+                important_size=important_size,
+                head_y_at=head_y_at,
+                zones={"mid_y": int(fg_top + 0.62 * fg_size[1])},
+            )
+        elif BEHIND_LAYOUT == "poster":
             build_poster_ass(
                 segments, start, end, ass_path, front_ass_path,
                 title=title,
