@@ -347,11 +347,10 @@ def _is_common_word(word: str) -> bool:
 
 # Rows for the "stack" look. Each pattern is a list of rows:
 # (words in the row, text size as a share of the "important" size, layer)
-STACK_GAP = .88          # distance between rows as a share of the text size (smaller = tighter)
-STACK_ATTACH_FRONT = False  # True = front rows sit right under the behind rows (one tight block);
+STACK_GAP = 0.88          # distance between rows as a share of the text size (smaller = tighter)
+STACK_ATTACH_FRONT = True  # True = front rows sit right under the behind rows (one tight block);
                            # False = front rows go down to a fixed height lower on the body
-                           # (the fixed "mid_y" zone, ~62% down - below center, not at the very bottom)
-STACK_TOP_FLOOR = 150     # a row never starts higher than this (keeps clear of the title)
+STACK_TOP_FLOOR = 215     # a row never starts higher than this (keeps clear of the title)
 STACK_PATTERNS = {
     "row3":        [(3, 0.80, "behind")],                                    # one row of 3 words
     "two_one":     [(2, 0.95, "behind"), (1, 1.30, "front")],                # 2 big words, then 1 BIGGEST
@@ -362,10 +361,6 @@ STACK_PATTERNS = {
     "one":         [(1, 1.20, "behind")],
     "two":         [(2, 1.00, "behind")],
     "one_front":   [(1, 1.30, "front")],
-    # Poster-style: a small row of 3 words up near the top (behind the person),
-    # then ONE big key word tucked just above the head/center (behind), then the
-    # remaining 2 words land below center - a clean, professional poster layout.
-    "poster_3_1_2": [(3, 0.60, "behind"), (1, 1.45, "behind"), (2, 0.85, "front")],
 }
 
 
@@ -1090,34 +1085,6 @@ def resolve_caption_font(lang_code: str):
     return fonts_dir, family
 
 
-# A bold, chunky poster-style display font (like the "Anton" look), used only
-# for the "behind" caption style's big key words so they look like a designed
-# poster instead of plain bold text. Downloaded once from Google's public
-# font repo; if that fails for any reason (no internet, blocked), the normal
-# bold Latin font is used instead and nothing breaks.
-DISPLAY_FONT_URL = "https://github.com/google/fonts/raw/main/ofl/anton/Anton-Regular.ttf"
-DISPLAY_FONT_FAMILY = "Anton"
-DISPLAY_FONT_LOCAL = "fonts/Anton-Regular.ttf"
-
-
-def ensure_display_font():
-    """Try to download the poster-style display font into the fonts/ folder
-    (the same folder libass already searches via fontsdir). Returns the font
-    family name to use, or None if it could not be obtained."""
-    os.makedirs("fonts", exist_ok=True)
-    if os.path.exists(DISPLAY_FONT_LOCAL) and os.path.getsize(DISPLAY_FONT_LOCAL) > 0:
-        return DISPLAY_FONT_FAMILY
-    try:
-        response = requests.get(DISPLAY_FONT_URL, timeout=20)
-        response.raise_for_status()
-        with open(DISPLAY_FONT_LOCAL, "wb") as f:
-            f.write(response.content)
-        return DISPLAY_FONT_FAMILY
-    except Exception as e:
-        print(f"WARNING: could not download the poster display font ({e}); using the default font instead.")
-        return None
-
-
 def probe_fit_geometry(video_path: str):
     """Return (fg_w, fg_h): the size the original video has after being fitted
     inside the 1080x1920 frame (same logic as the foreground in cut_vertical_clip)."""
@@ -1388,13 +1355,11 @@ def render_captioned_clip(
     if style == "behind":
         front_ass_path = str(Path(ass_path).with_suffix(".front.ass"))
         fg_top = (1920 - fg_size[1]) / 2.0
-        poster_font_family = ensure_display_font() or font_family
-        print(f"  poster caption font: {poster_font_family}")
         if BEHIND_LAYOUT == "stack":
             build_stack_ass(
                 segments, start, end, ass_path, front_ass_path,
                 title=title,
-                caption_font_family=poster_font_family,
+                caption_font_family=font_family,
                 colors=colors,
                 important_size=important_size,
                 head_y_at=head_y_at,
@@ -1404,7 +1369,7 @@ def render_captioned_clip(
             build_poster_ass(
                 segments, start, end, ass_path, front_ass_path,
                 title=title,
-                caption_font_family=poster_font_family,
+                caption_font_family=font_family,
                 colors=colors,
                 important_size=important_size,
                 head_y_at=head_y_at,
@@ -1418,7 +1383,7 @@ def render_captioned_clip(
             build_all_behind_ass(
                 segments, start, end, ass_path, front_ass_path,
                 title=title,
-                caption_font_family=poster_font_family,
+                caption_font_family=font_family,
                 colors=colors,
                 important_size=important_size,
                 head_y_at=head_y_at,
@@ -1426,7 +1391,7 @@ def render_captioned_clip(
         else:
           build_behind_ass(
             segments, start, end, ass_path, front_ass_path,
-            caption_font_family=poster_font_family,
+            caption_font_family=font_family,
             colors=colors,
             important_size=important_size,
             common_size=common_size,
