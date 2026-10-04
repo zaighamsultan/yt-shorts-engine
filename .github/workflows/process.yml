@@ -40,7 +40,7 @@ on:
         required: false
         default: ""
       rows_config:
-        description: "Optional JSON with the 5 caption rows for the behind look (set by the WordPress plugin)"
+        description: "Optional JSON with the 2 to 5 caption rows for the behind look (set by the WordPress plugin)"
         required: false
         default: ""
 
