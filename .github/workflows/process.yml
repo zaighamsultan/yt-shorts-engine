@@ -39,6 +39,10 @@ on:
         description: "Caption look: empty/classic = bottom captions, behind = big captions behind the person"
         required: false
         default: ""
+      rows_config:
+        description: "Optional JSON with the 5 caption rows for the behind look (set by the WordPress plugin)"
+        required: false
+        default: ""
 
 jobs:
   process:
@@ -74,6 +78,7 @@ jobs:
           IMPORTANT_SIZE: ${{ inputs.important_size }}
           COMMON_SIZE: ${{ inputs.common_size }}
           CAPTION_STYLE: ${{ inputs.caption_style }}
+          ROWS_CONFIG: ${{ inputs.rows_config }}
         run: |
           args=(--video "$VIDEO_URL")
           if [ -n "$BRAND_TEXT" ]; then
@@ -96,6 +101,9 @@ jobs:
           fi
           if [ -n "$CAPTION_STYLE" ]; then
             args+=(--caption-style "$CAPTION_STYLE")
+          fi
+          if [ -n "$ROWS_CONFIG" ]; then
+            args+=(--rows-config "$ROWS_CONFIG")
           fi
           python process_video.py "${args[@]}"
 
