@@ -60,8 +60,30 @@ jobs:
       - name: Installing video tools and fonts
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core fonts-noto-core libgl1
+          sudo apt-get install -y --no-install-recommends ffmpeg libgl1 \
+            fonts-dejavu-core fonts-noto-core fonts-liberation \
+            fonts-crosextra-carlito fonts-crosextra-caladea \
+            fonts-roboto fonts-roboto-slab fonts-open-sans fonts-lato fonts-montserrat \
+            fonts-inter fonts-ubuntu fonts-cantarell fonts-cabin \
+            fonts-bebas-neue fonts-quicksand fonts-comfortaa fonts-lobstertwo
           pip install -r requirements.txt
+
+      - name: Adding extra caption fonts
+        # Poppins, Anton, Bangers, Pacifico and Permanent Marker have no Ubuntu package, so they
+        # come from the Google Fonts repository. If one download fails the job still runs: that
+        # font simply falls back to DejaVu Sans.
+        run: |
+          mkdir -p "$HOME/.fonts"
+          base=https://raw.githubusercontent.com/google/fonts/main
+          for f in ofl/anton/Anton-Regular.ttf \
+                   ofl/bangers/Bangers-Regular.ttf \
+                   ofl/pacifico/Pacifico-Regular.ttf \
+                   apache/permanentmarker/PermanentMarker-Regular.ttf \
+                   ofl/poppins/Poppins-Regular.ttf ofl/poppins/Poppins-Bold.ttf \
+                   ofl/poppins/Poppins-Italic.ttf ofl/poppins/Poppins-BoldItalic.ttf; do
+            curl -fsSL --retry 3 -o "$HOME/.fonts/$(basename "$f")" "$base/$f" || echo "Could not download $f"
+          done
+          fc-cache -f
 
       - name: Waiting for your turn
         run: sleep $((RANDOM % 20))
