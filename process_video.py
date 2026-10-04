@@ -364,18 +364,74 @@ STACK_PATTERNS = {
 }
 
 
-# --- Custom rows: every row is set by the user (position, size, layer, words, colors) ---
+# --- Custom rows: every row is set by the user -------------------------------------------
+# Per row: on/off, position (% from top), left/right margins (%), text size (10-400),
+# layer (behind / in front of the person), words per row, highlight colors, alignment and a
+# "Word-like" text format: font, bold/italic, underline/strike, letter case, letter spacing,
+# outline thickness + color, shadow.
 ROWS_CONFIG = None   # list of up to 5 row dicts, set from --rows-config (see parse_rows_config)
-ROWS_MIN_SIZE = 24
-ROWS_MAX_SIZE = 220
+ROWS_MIN_SIZE = 10
+ROWS_MAX_SIZE = 400
 ROWS_MAX_WORDS = 5
+ROWS_MAX_SIDE = 90   # left % + right % may never be more than this (text area stays >= 10% wide)
+
+# Fonts a row may use: family name -> average character width as a share of the font size
+# (bold text). The width is used to shrink long text so it stays inside the row's left/right
+# area. KEEP THIS LIST IN SYNC with yts_row_fonts() in the WordPress plugin; a font that is not
+# in this list falls back to DejaVu Sans, so a bad value can never break a job.
+ROW_FONTS = {
+    "DejaVu Sans": 0.66, "Liberation Sans": 0.58, "Carlito": 0.52, "Roboto": 0.57,
+    "Open Sans": 0.60, "Lato": 0.56, "Montserrat": 0.70, "Poppins": 0.66, "Inter": 0.62,
+    "Ubuntu": 0.58, "Cantarell": 0.58, "Cabin": 0.54, "Noto Sans": 0.60,
+    "DejaVu Serif": 0.66, "Liberation Serif": 0.54, "Caladea": 0.56, "Roboto Slab": 0.60,
+    "Noto Serif": 0.60,
+    "DejaVu Sans Mono": 0.62, "Liberation Mono": 0.62,
+    "Anton": 0.46, "Bebas Neue": 0.42, "Bangers": 0.50,
+    "Quicksand": 0.58, "Comfortaa": 0.66,
+    "Lobster Two": 0.50, "Pacifico": 0.56, "Permanent Marker": 0.56,
+}
+DEFAULT_ROW_FONT = "DejaVu Sans"
+
+ROW_STYLES = ("regular", "bold", "italic", "bolditalic")
+ROW_DECOS = ("none", "underline", "strike")
+ROW_CASES = ("none", "upper", "lower", "title")
+ROW_ALIGNS = ("left", "center", "right")
+ROW_OUTLINES = ("none", "thin", "normal", "thick", "heavy")
+ROW_SHADOWS = ("none", "soft", "medium", "strong")
+ROW_SPACING_MIN, ROW_SPACING_MAX = -20, 80
+FIT_SAFETY = 0.97   # shrink-to-fit leaves 3% spare (fake-bold and script fonts are a little wider)
+
+# outline thickness: (share of the text size, minimum px)   - "normal" = the original look
+OUTLINE_RULES = {"none": (0, 0), "thin": (0.025, 2), "normal": (0.045, 3),
+                 "thick": (0.07, 4), "heavy": (0.10, 6)}
+# shadow distance: (share of the text size, minimum px)
+SHADOW_RULES = {"none": (0, 0), "soft": (0.03, 2), "medium": (0.06, 4), "strong": (0.10, 6)}
+
+
+def _enum(value, allowed, default):
+    value = str(value).strip().lower() if value is not None else ""
+    return value if value in allowed else default
+
+
+def _bool(value, default):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _hex_to_rgb(value, default):
+    h = str(value or "").strip().lstrip("#")
+    if re.fullmatch(r"[0-9A-Fa-f]{6}", h):
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return default
 
 
 def parse_rows_config(raw):
-    """Read the --rows-config JSON from the plugin. Returns a list of row dicts
-    (on, pos 0-100 = % from the top, size in px, layer 'behind'/'front', words per
-    row, colors as RGB tuples) or None if nothing usable was given.
-    Every value is checked, so a bad value can never break a job."""
+    """Read the --rows-config JSON from the plugin. Returns a list of row dicts or None if
+    nothing usable was given. Every value is checked and forced into its allowed range
+    (or one of the allowed words), so a bad value can never break a job."""
     if not raw or not str(raw).strip():
         return None
     try:
@@ -391,12 +447,29 @@ def parse_rows_config(raw):
         if not isinstance(item, dict):
             continue
         try:
+            left = min(float(ROWS_MAX_SIDE), max(0.0, float(item.get("left", 5))))
+            right = min(float(ROWS_MAX_SIDE), max(0.0, float(item.get("right", 5))))
+            if left + right > ROWS_MAX_SIDE:          # keep at least 10% of the width for the text
+                right = max(0.0, ROWS_MAX_SIDE - left)
+            font = str(item.get("font") or DEFAULT_ROW_FONT).strip()
             row = {
-                "on": bool(item.get("on", True)),
+                "on": _bool(item.get("on"), True),
                 "pos": min(100.0, max(0.0, float(item.get("pos", 50)))),
+                "left": left,
+                "right": right,
                 "size": int(min(ROWS_MAX_SIZE, max(ROWS_MIN_SIZE, float(item.get("size", 90))))),
                 "layer": "behind" if item.get("layer") == "behind" else "front",
                 "words": int(min(ROWS_MAX_WORDS, max(1, int(item.get("words", 1))))),
+                "align": _enum(item.get("align"), ROW_ALIGNS, "center"),
+                "fit": _bool(item.get("fit"), True),
+                "font": font if font in ROW_FONTS else DEFAULT_ROW_FONT,
+                "style": _enum(item.get("style"), ROW_STYLES, "bold"),
+                "deco": _enum(item.get("deco"), ROW_DECOS, "none"),
+                "case": _enum(item.get("case"), ROW_CASES, "none"),
+                "spacing": int(min(ROW_SPACING_MAX, max(ROW_SPACING_MIN, float(item.get("spacing", 0))))),
+                "outline": _enum(item.get("outline"), ROW_OUTLINES, "normal"),
+                "outline_color": _hex_to_rgb(item.get("outline_color"), (0, 0, 0)),
+                "shadow": _enum(item.get("shadow"), ROW_SHADOWS, "none"),
             }
         except (TypeError, ValueError):
             continue
@@ -408,6 +481,147 @@ def parse_rows_config(raw):
         row["colors"] = colors
         rows.append(row)
     return rows or None
+
+
+_FONT_CHECKED = {}
+
+
+def resolve_row_font(family: str) -> str:
+    """Make sure the font really exists on this machine (asks fontconfig). If it does not,
+    DejaVu Sans is used and a warning is printed, so the text never turns into odd boxes."""
+    if family in _FONT_CHECKED:
+        return _FONT_CHECKED[family]
+    result = family
+    try:
+        out = subprocess.run(
+            ["fc-match", "-f", "%{family}", family],
+            capture_output=True, text=True, timeout=15,
+        ).stdout
+        names = [n.strip().lower() for n in out.split(",") if n.strip()]
+        if names and family.lower() not in names:
+            print(f"WARNING: font '{family}' is not installed here, using {DEFAULT_ROW_FONT} instead.")
+            result = DEFAULT_ROW_FONT
+    except Exception:
+        pass   # fc-match not available (for example on Windows): just trust the name
+    _FONT_CHECKED[family] = result
+    return result
+
+
+def _apply_case(word: str, mode: str) -> str:
+    if mode == "upper":
+        return word.upper()
+    if mode == "lower":
+        return word.lower()
+    if mode == "title":
+        return word[:1].upper() + word[1:].lower()
+    return word
+
+
+_FONT_FILE_CACHE = {}
+_PIL_FONT_CACHE = {}
+
+
+def _font_file(family: str, bold: bool, italic: bool):
+    """Path of the real font file for this family + style (asked from fontconfig)."""
+    key = (family, bold, italic)
+    if key in _FONT_FILE_CACHE:
+        return _FONT_FILE_CACHE[key]
+    path = None
+    try:
+        pattern = family + (":bold" if bold else "") + (":italic" if italic else "")
+        out = subprocess.run(["fc-match", "-f", "%{file}", pattern],
+                             capture_output=True, text=True, timeout=15).stdout.strip()
+        if out and os.path.exists(out):
+            path = out
+    except Exception:
+        pass
+    _FONT_FILE_CACHE[key] = path
+    return path
+
+
+_CELL_RATIO_CACHE = {}
+
+
+def _font_cell_ratio(path: str) -> float:
+    """libass treats the ASS font size (\\fs) as the height of the font's whole line cell
+    (Windows ascent + descent), NOT as the size of the letter 'em'. Fonts with tall cells
+    (Anton, Bebas Neue...) therefore come out smaller than their nominal size. This reads
+    unitsPerEm / (winAscent + winDescent) straight from the font file, so a size can be
+    converted exactly. Returns 1.0 if the file cannot be read."""
+    if path in _CELL_RATIO_CACHE:
+        return _CELL_RATIO_CACHE[path]
+    ratio = 1.0
+    try:
+        import struct
+        with open(path, "rb") as f:
+            head = f.read(12)
+            if head[:4] == b"ttcf":                      # font collection: use its first font
+                offset = struct.unpack(">I", f.read(12)[8:12])[0]
+                f.seek(offset)
+                head = f.read(12)
+            num = struct.unpack(">H", head[4:6])[0]
+            tables = {}
+            for _ in range(num):
+                rec = f.read(16)
+                tables[rec[:4]] = struct.unpack(">II", rec[8:16])   # (offset, length)
+
+            def read(tag, start, size):
+                f.seek(tables[tag][0] + start)
+                return f.read(size)
+
+            upem = struct.unpack(">H", read(b"head", 18, 2))[0]
+            cell = 0
+            if b"OS/2" in tables:
+                asc, desc = struct.unpack(">HH", read(b"OS/2", 74, 4))
+                cell = asc + desc
+            if not cell and b"hhea" in tables:
+                asc, desc = struct.unpack(">hh", read(b"hhea", 4, 4))
+                cell = asc - desc
+            if upem and cell:
+                ratio = upem / float(cell)
+    except Exception:
+        ratio = 1.0
+    _CELL_RATIO_CACHE[path] = ratio
+    return ratio
+
+
+def _measure_width_100(row: dict, text: str):
+    """Width in pixels of `text` drawn at ASS size 100 in this row's real font, or None if it
+    cannot be measured (Pillow / fontconfig missing). Measuring the real font makes the
+    shrink-to-fit exact for every font, narrow ones like Anton and wide ones like Montserrat."""
+    try:
+        from PIL import ImageFont
+        path = _font_file(row["font"], row["style"] in ("bold", "bolditalic"),
+                          row["style"] in ("italic", "bolditalic"))
+        if not path:
+            return None
+        font = _PIL_FONT_CACHE.get(path)
+        if font is None:
+            font = ImageFont.truetype(path, 100)
+            _PIL_FONT_CACHE[path] = font
+        # width at ASS size 100 (see _font_cell_ratio for why the ratio is needed)
+        return float(font.getlength(text)) * _font_cell_ratio(path)
+    except Exception:
+        return None
+
+
+def _row_font_size(row: dict, row_words: list) -> int:
+    """Text size of one row. If 'fit' is on, long text is shrunk so it stays inside the
+    row's left/right area; otherwise the size set by the user is used exactly."""
+    size = row["size"]
+    if not row["fit"]:
+        return max(ROWS_MIN_SIZE, size)
+    band_w = (100.0 - row["left"] - row["right"]) / 100.0 * 1080 * FIT_SAFETY
+    text = " ".join(row_words)
+    n = max(1, len(text))
+    avail = band_w - row["spacing"] * n          # letter spacing is added after every character
+    w100 = _measure_width_100(row, text)
+    if w100:
+        fit = int(max(0.0, avail) * 100.0 / w100)
+    else:                                         # fallback: average character width of the font
+        char_w = ROW_FONTS.get(row["font"], 0.66) * (1.12 if row["case"] == "upper" else 1.0)
+        fit = int(max(0.0, avail) / (n * char_w))
+    return max(ROWS_MIN_SIZE, min(size, fit))
 
 
 def build_custom_rows_ass(
@@ -461,19 +675,47 @@ def build_custom_rows_ass(
                 card_end = seg_t0 + (i + len(card)) * word_dur
                 taken = 0
                 for ri, row in enumerate(rows):
-                    row_words = [w.strip(".,;:\"'") for w in card[taken:taken + row["words"]]]
+                    row_words = [_apply_case(w.strip(".,;:\"'"), row["case"])
+                                 for w in card[taken:taken + row["words"]]]
                     if not row_words:
                         break
                     first = i + taken
                     taken += len(row_words)
                     n = len(row_words)
 
-                    chars = sum(len(w) for w in row_words) + (n - 1)
-                    fs = max(ROWS_MIN_SIZE, min(row["size"], int(960 / (max(1, chars) * 0.66))))
+                    fs = _row_font_size(row, row_words)
                     y = int(row["pos"] / 100.0 * 1920)
                     y = max(fs // 2, min(1920 - fs // 2, y))
-                    bord = max(3, int(fs * 0.045))
                     is_behind = row["layer"] == "behind"
+
+                    # horizontal area of this row: from the left % to (100 - right) %
+                    x_left = int(round(row["left"] / 100.0 * 1080))
+                    x_right = int(round((100.0 - row["right"]) / 100.0 * 1080))
+                    if row["align"] == "left":
+                        an, x = 4, x_left
+                    elif row["align"] == "right":
+                        an, x = 6, x_right
+                    else:
+                        an, x = 5, (x_left + x_right) // 2
+
+                    out_share, out_min = OUTLINE_RULES[row["outline"]]
+                    bord = 0 if row["outline"] == "none" else max(out_min, int(fs * out_share))
+                    shd_share, shd_min = SHADOW_RULES[row["shadow"]]
+                    shad = 0 if row["shadow"] == "none" else max(shd_min, int(fs * shd_share))
+                    orr, ogg, obb = row["outline_color"]
+                    font = resolve_row_font(row["font"])
+                    bold = 1 if row["style"] in ("bold", "bolditalic") else 0
+                    italic = 1 if row["style"] in ("italic", "bolditalic") else 0
+                    under = 1 if row["deco"] == "underline" else 0
+                    strike = 1 if row["deco"] == "strike" else 0
+                    # \q2 = never wrap the row onto a second line; \4a = soft shadow
+                    fmt = (
+                        f"\\an{an}\\pos({x},{y})\\q2\\fn{font}\\fs{fs}\\b{bold}\\i{italic}"
+                        f"\\u{under}\\s{strike}\\fsp{row['spacing']}\\bord{bord}"
+                        f"\\3c&H{obb:02X}{ogg:02X}{orr:02X}&"
+                        f"\\shad{shad}\\4c&H000000&"
+                    )
+                    shadow_alpha = "\\4a&H70&" if shad else ""
 
                     word_colors = []
                     for _ in row_words:
@@ -499,15 +741,14 @@ def build_custom_rows_ass(
                                     pop = "\\fscx78\\fscy78\\t(0,130,\\fscx106\\fscy106)\\t(130,200,\\fscx100\\fscy100)"
                                 else:
                                     pop = "\\fscx100\\fscy100"
-                                parts.append("{\\alpha&H00&" + rgb_to_ass_inline(cr, cg, cb) + pop + "}" + safe)
+                                parts.append("{\\alpha&H00&" + shadow_alpha + rgb_to_ass_inline(cr, cg, cb) + pop + "}" + safe)
                         fade_in = 40 if j == 0 else 0
                         fade_out = 60 if j == n - 1 else 0
                         fad = f"\\fad({fade_in},{fade_out})" if (fade_in or fade_out) else ""
-                        tags = f"\\an5\\pos(540,{y})\\fs{fs}\\bord{bord}{fad}"
                         line = (
                             f"Dialogue: {0 if is_behind else 1 + ri},{format_ass_time(e0)},{format_ass_time(e1)},"
                             f"{'Behind' if is_behind else 'Default'},,0,0,0,,"
-                            + "{" + tags + "}" + " ".join(parts)
+                            + "{" + fmt + fad + "}" + " ".join(parts)
                         )
                         (behind_lines if is_behind else front_lines).append(line)
                 i += card_size
