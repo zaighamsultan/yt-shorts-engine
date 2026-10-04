@@ -2,3 +2,4 @@ groq
 google-genai
 requests
 mediapipe==0.10.21
+pillow
