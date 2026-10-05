@@ -101,6 +101,8 @@ jobs:
           COMMON_SIZE: ${{ inputs.common_size }}
           CAPTION_STYLE: ${{ inputs.caption_style }}
           ROWS_CONFIG: ${{ inputs.rows_config }}
+          # Optional: cookies.txt of a YouTube account, helps when YouTube blocks the server (see README)
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
         run: |
           args=(--video "$VIDEO_URL")
           if [ -n "$BRAND_TEXT" ]; then
