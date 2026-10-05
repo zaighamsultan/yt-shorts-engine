@@ -1,6 +1,6 @@
 """
 Simple YouTube-to-Shorts engine.
-Takes a video URL (YouTube, Google Drive or a direct video file link) or a local file, transcribes it,
+Takes a video URL (direct video file link) or a local file, transcribes it,
 asks Gemini to pick the best short moments, and cuts vertical (9:16) clips.
 
 Runs on GitHub Actions (free tier) - no server needed.
@@ -13,133 +13,61 @@ import json
 import shutil
 import argparse
 import subprocess
-import tempfile
 import datetime
 from pathlib import Path
-from urllib.parse import urlparse
 
 import requests
 from groq import Groq
 from google import genai
 
 
-# --- YouTube links ---------------------------------------------------------
-# A normal link (Google Drive, direct mp4 ...) is downloaded exactly as before.
-# A YouTube link is downloaded with yt-dlp instead.
-YOUTUBE_HOSTS = {
-    "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com",
-    "youtu.be", "www.youtu.be", "youtube-nocookie.com", "www.youtube-nocookie.com",
-}
-# The audio is sent to Groq in one piece (limit 25 MB). At the engine's audio quality
-# that is about 52 minutes, so longer YouTube videos are refused with a clear message.
-YOUTUBE_MAX_MINUTES = 50
-# Best quality up to 1080p, preferring mp4 so no re-encoding is needed
-YOUTUBE_FORMAT = (
-    "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080][ext=mp4]/"
-    "bv*[height<=1080]+ba/b[height<=1080]/b"
-)
+def is_google_drive_url(url: str) -> bool:
+    return "drive.google.com" in url or "drive.usercontent.google.com" in url
 
 
-def is_youtube_url(source: str) -> bool:
-    """True only if the HOST is YouTube (so 'evil.com/?x=youtube.com' does not count)."""
-    try:
-        parsed = urlparse(source.strip())
-        host = (parsed.hostname or "").lower()
-    except ValueError:
-        return False
-    return parsed.scheme in ("http", "https") and host in YOUTUBE_HOSTS
+def extract_drive_file_id(url: str):
+    """Pull the file ID out of any common Google Drive link shape:
+    .../file/d/ID/view, .../open?id=ID, .../uc?...&id=ID, .../download?...&id=ID"""
+    for pattern in (r"/file/d/([a-zA-Z0-9_-]+)", r"[?&]id=([a-zA-Z0-9_-]+)"):
+        m = re.search(pattern, url)
+        if m:
+            return m.group(1)
+    return None
 
 
-def _youtube_error_message(log: str) -> str:
-    low = log.lower()
-    if "does not pass filter" in low:
-        return (f"This YouTube video is longer than {YOUTUBE_MAX_MINUTES} minutes (or is a live stream). "
-                f"Please use a shorter video.")
-    if "sign in to confirm" in low or "not a bot" in low:
-        return ("YouTube blocked this server with its 'confirm you're not a bot' check. "
-                "Fix: add your YouTube cookies as the GitHub secret YT_COOKIES (see README), "
-                "or use a Google Drive / direct video link instead.")
-    if "private video" in low:
-        return "This YouTube video is private."
-    if "members-only" in low or "join this channel" in low:
-        return "This YouTube video is for channel members only."
-    if "confirm your age" in low or "age-restricted" in low or "inappropriate for some users" in low:
-        return "This YouTube video is age-restricted. Add YouTube cookies (secret YT_COOKIES) from a signed-in account."
-    if "video unavailable" in low or "has been removed" in low or "not available" in low:
-        return "This YouTube video is unavailable (removed, blocked in this country, or the link is wrong)."
-    if "http error 429" in low or "too many requests" in low:
-        return "YouTube is rate-limiting this server (too many requests). Try again in a few minutes."
-    tail = "\n".join(log.strip().splitlines()[-8:])
-    return f"The YouTube download failed. Last lines from yt-dlp:\n{tail}"
-
-
-def download_youtube(url: str, out_path: str) -> str:
-    """Download a YouTube video to out_path with yt-dlp.
-    YouTube often blocks the servers GitHub Actions runs on ('confirm you're not a bot').
-    Cookies from a YouTube account help; put the cookies.txt content in the GitHub secret
-    YT_COOKIES (optional). The cookies are written to a temporary file that is always
-    deleted, and are never placed in the output folder."""
-    cookies_text = os.environ.get("YT_COOKIES", "").strip()
-    cookie_path = None
-    try:
-        if cookies_text:
-            fd, cookie_path = tempfile.mkstemp(prefix="yt_cookies_", suffix=".txt")
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(cookies_text + "\n")
-            os.chmod(cookie_path, 0o600)
-            print("  using YouTube cookies from the YT_COOKIES secret")
-
-        base = [
-            sys.executable, "-m", "yt_dlp",
-            "--no-config", "--no-playlist", "--no-progress", "--no-colors",
-            "-f", YOUTUBE_FORMAT, "--merge-output-format", "mp4",
-            "--js-runtimes", "node",
-            "--match-filters", f"duration<={YOUTUBE_MAX_MINUTES * 60} & !is_live",
-            "--socket-timeout", "30", "--retries", "5", "--fragment-retries", "5",
-            "--force-overwrites", "-o", out_path,
-        ]
-        if cookie_path:
-            base += ["--cookies", cookie_path]
-            attempts = [[], ["-4"], ["--extractor-args", "youtube:player_client=web_safari"]]
-        else:
-            attempts = [[], ["--extractor-args", "youtube:player_client=tv,web_safari"], ["-4"]]
-
-        # words in yt-dlp's output after which trying again cannot help
-        final_errors = ("does not pass filter", "private video", "members-only", "join this channel",
-                        "has been removed", "video unavailable")
-        log = ""
-        for n, extra in enumerate(attempts, 1):
-            print(f"  YouTube download, attempt {n} of {len(attempts)}...")
-            try:
-                # "--" ends the options, so the link can never be read as an option
-                result = subprocess.run(base + extra + ["--", url], capture_output=True, text=True, timeout=3600)
-            except subprocess.TimeoutExpired:
-                raise RuntimeError("The YouTube download took too long and was stopped.")
-            log = (result.stdout or "") + "\n" + (result.stderr or "")
-            print("\n".join("    " + line for line in log.strip().splitlines()[-4:]))
-            if result.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-                return out_path
-            if any(word in log.lower() for word in final_errors):
-                break
-        raise RuntimeError(_youtube_error_message(log))
-    finally:
-        if cookie_path and os.path.exists(cookie_path):
-            os.remove(cookie_path)
+def download_from_drive(url: str, out_path: str) -> str:
+    """Download a Google Drive link in whatever form someone shared it
+    (the normal 'view' share link included). Handles Drive's "can't scan
+    this file for viruses" confirmation step for larger files automatically,
+    via the gdown package - the same problem plain requests.get() can't
+    solve, which is why a plain share link used to fail."""
+    file_id = extract_drive_file_id(url)
+    if not file_id:
+        raise ValueError(f"Could not find a Google Drive file ID in this link: {url}")
+    import gdown
+    result = gdown.download(id=file_id, output=out_path, quiet=False)
+    if not result:
+        raise RuntimeError(
+            f"Could not download Google Drive file {file_id}. Make sure it's "
+            "shared as 'Anyone with the link' (not restricted)."
+        )
+    return out_path
 
 
 def download_video(source: str, out_path: str) -> str:
-    """Get the video to a local path. Downloads it if source is a URL (YouTube links
-    use yt-dlp, every other link is downloaded directly), otherwise copies it (for
-    running locally with a file on your PC)."""
-    if is_youtube_url(source):
-        print("YouTube link detected - downloading with yt-dlp...")
-        return download_youtube(source.strip(), out_path)
+    """Get the video to a local path.
+    - A Google Drive link (any common share-link format) is downloaded with gdown.
+    - Any other URL (a direct video file link) is downloaded as-is.
+    - A local path (not a URL) is just copied, for running on your PC."""
     if source.startswith("http://") or source.startswith("https://"):
-        response = requests.get(source, stream=True, timeout=120)
-        response.raise_for_status()
-        with open(out_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
+        if is_google_drive_url(source):
+            download_from_drive(source, out_path)
+        else:
+            response = requests.get(source, stream=True, timeout=120)
+            response.raise_for_status()
+            with open(out_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
     else:
         shutil.copy(source, out_path)
     return out_path
