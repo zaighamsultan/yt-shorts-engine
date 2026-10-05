@@ -372,7 +372,7 @@ STACK_PATTERNS = {
 ROWS_CONFIG = None   # list of up to 5 row dicts, set from --rows-config (see parse_rows_config)
 ROWS_MIN_SIZE = 10
 ROWS_MAX_SIZE = 400
-ROWS_MAX_WORDS = 5
+ROWS_MAX_WORDS = 9
 ROWS_MAX_SIDE = 90   # left % + right % may never be more than this (text area stays >= 10% wide)
 
 # Fonts a row may use: family name -> average character width as a share of the font size
@@ -624,6 +624,100 @@ def _row_font_size(row: dict, row_words: list) -> int:
     return max(ROWS_MIN_SIZE, min(size, fit))
 
 
+# --- Classic look: important words and common words each get their own text format ----------
+# Sent by the plugin inside --rows-config as {"classic": {...}}. Without it the classic captions
+# look exactly as before. Shared by the whole line: position, left/right %, alignment, words
+# per line, shrink-to-fit. Separate for "important" and "common" words: font, size (10-400),
+# bold/italic, underline/strike, letter case, spacing, outline (+color), shadow, text color.
+CLASSIC_CONFIG = None
+CLASSIC_DEFAULT_SIZES = {"important": DEFAULT_IMPORTANT_SIZE, "common": DEFAULT_COMMON_SIZE}
+
+
+def _parse_word_format(item, kind):
+    """One word format (important or common). Every value is forced into its allowed range."""
+    item = item if isinstance(item, dict) else {}
+    font = str(item.get("font") or DEFAULT_ROW_FONT).strip()
+    try:
+        size = int(min(ROWS_MAX_SIZE, max(ROWS_MIN_SIZE, float(item.get("size", CLASSIC_DEFAULT_SIZES[kind])))))
+    except (TypeError, ValueError):
+        size = CLASSIC_DEFAULT_SIZES[kind]
+    try:
+        spacing = int(min(ROW_SPACING_MAX, max(ROW_SPACING_MIN, float(item.get("spacing", 0)))))
+    except (TypeError, ValueError):
+        spacing = 0
+    return {
+        "size": size,
+        "font": font if font in ROW_FONTS else DEFAULT_ROW_FONT,
+        "style": _enum(item.get("style"), ROW_STYLES, "bold"),
+        "deco": _enum(item.get("deco"), ROW_DECOS, "none"),
+        "case": _enum(item.get("case"), ROW_CASES, "none"),
+        "spacing": spacing,
+        "outline": _enum(item.get("outline"), ROW_OUTLINES, "normal"),
+        "outline_color": _hex_to_rgb(item.get("outline_color"), (0, 0, 0)),
+        "shadow": _enum(item.get("shadow"), ROW_SHADOWS, "none"),
+        "color": _hex_to_rgb(item.get("color"), (255, 255, 255)),
+    }
+
+
+def parse_classic_config(raw):
+    """Read the "classic" part of --rows-config. Returns a dict or None if not given."""
+    if not raw or not str(raw).strip():
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    c = data.get("classic") if isinstance(data, dict) else None
+    if not isinstance(c, dict):
+        return None
+    try:
+        left = min(float(ROWS_MAX_SIDE), max(0.0, float(c.get("left", 5))))
+        right = min(float(ROWS_MAX_SIDE), max(0.0, float(c.get("right", 5))))
+        if left + right > ROWS_MAX_SIDE:
+            right = max(0.0, ROWS_MAX_SIDE - left)
+        pos = min(100.0, max(0.0, float(c.get("pos", 84))))
+        words = int(min(ROWS_MAX_WORDS, max(1, int(c.get("words", 5)))))
+    except (TypeError, ValueError):
+        return None
+    colors = []
+    for col in (c.get("colors") or []):
+        h = str(col).strip().lstrip("#")
+        if re.fullmatch(r"[0-9A-Fa-f]{6}", h):
+            colors.append(tuple(int(h[i:i + 2], 16) for i in (0, 2, 4)))
+    common_colors = []
+    for col in (c.get("common_colors") or []):
+        h = str(col).strip().lstrip("#")
+        if re.fullmatch(r"[0-9A-Fa-f]{6}", h):
+            common_colors.append(tuple(int(h[i:i + 2], 16) for i in (0, 2, 4)))
+    return {
+        "colors": colors,   # important words use these colors in turn (empty = default colors)
+        "common_colors": common_colors,   # common words use these colors in turn (empty = text color)
+        "left": left, "right": right, "pos": pos, "words": words,
+        "align": _enum(c.get("align"), ROW_ALIGNS, "center"),
+        "fit": _bool(c.get("fit"), True),
+        "important": _parse_word_format(c.get("important"), "important"),
+        "common": _parse_word_format(c.get("common"), "common"),
+    }
+
+
+def _word_tags(fmt: dict, fs: int) -> str:
+    """ASS override tags for one word in the given format at size fs."""
+    out_share, out_min = OUTLINE_RULES[fmt["outline"]]
+    bord = 0 if fmt["outline"] == "none" else max(out_min, int(fs * out_share))
+    shd_share, shd_min = SHADOW_RULES[fmt["shadow"]]
+    shad = 0 if fmt["shadow"] == "none" else max(shd_min, int(fs * shd_share))
+    orr, ogg, obb = fmt["outline_color"]
+    font = resolve_row_font(fmt["font"])
+    bold = 1 if fmt["style"] in ("bold", "bolditalic") else 0
+    italic = 1 if fmt["style"] in ("italic", "bolditalic") else 0
+    return (
+        f"\\fn{font}\\fs{fs}\\b{bold}\\i{italic}"
+        f"\\u{1 if fmt['deco'] == 'underline' else 0}\\s{1 if fmt['deco'] == 'strike' else 0}"
+        f"\\fsp{fmt['spacing']}\\bord{bord}\\3c&H{obb:02X}{ogg:02X}{orr:02X}&"
+        f"\\shad{shad}\\4c&H000000&" + ("\\4a&H70&" if shad else "")
+    )
+
+
 def build_custom_rows_ass(
     segments: list,
     clip_start: float,
@@ -657,7 +751,6 @@ def build_custom_rows_ass(
 
     if rows:
         card_size = sum(r["words"] for r in rows)
-        color_count = [0] * len(rows)   # colors keep cycling from card to card
         for seg in segments:
             if not (seg["end"] > clip_start and seg["start"] < clip_end):
                 continue
@@ -717,13 +810,11 @@ def build_custom_rows_ass(
                     )
                     shadow_alpha = "\\4a&H70&" if shad else ""
 
-                    word_colors = []
-                    for _ in row_words:
-                        if row["colors"]:
-                            word_colors.append(row["colors"][color_count[ri] % len(row["colors"])])
-                            color_count[ri] += 1
-                        else:
-                            word_colors.append((255, 255, 255))
+                    # one color per word of the row: word 1 = first color, word 2 = second ...
+                    # (an older config with fewer colors than words repeats them; none = white)
+                    cols = row["colors"]
+                    word_colors = [cols[k % len(cols)] if cols else (255, 255, 255)
+                                   for k in range(len(row_words))]
 
                     for j in range(n):
                         e0 = seg_t0 + (first + j) * word_dur
@@ -1331,6 +1422,7 @@ def build_captions_ass(
     colors: list = None,
     important_size: int = DEFAULT_IMPORTANT_SIZE,
     common_size: int = DEFAULT_COMMON_SIZE,
+    classic: dict = None,
 ):
     """Build an ASS caption file for the segments inside one clip. Common
     (stop) words stay white and smaller; other words cycle through the chosen
@@ -1338,6 +1430,10 @@ def build_captions_ass(
     highlights the meaningful words.
     If a title is given, it's shown at the top for the first few seconds."""
     palette = colors or WORD_COLORS
+    if classic:
+        words_per_line = classic["words"]
+        if classic.get("colors"):
+            palette = classic["colors"]
 
     clip_segments = [
         s for s in segments
@@ -1370,7 +1466,56 @@ def build_captions_ass(
         )
 
     color_i = 0
+    common_i = 0
     for start, end, chunk_words in lines:
+        if classic:
+            # --- own format for important and common words, placed by left/right % ---
+            items = []   # (text, format, color)
+            for w in chunk_words:
+                is_common = w.strip(".,!?;:").lower() in STOPWORDS
+                fmt = classic["common" if is_common else "important"]
+                if is_common:
+                    own = classic.get("common_colors") or [fmt["color"]]
+                    color = own[common_i % len(own)]
+                    common_i += 1
+                else:
+                    color = palette[color_i % len(palette)]
+                    color_i += 1
+                items.append((_apply_case(w, fmt["case"]), fmt, color))
+            scale = 1.0
+            if classic["fit"]:
+                band_w = (100.0 - classic["left"] - classic["right"]) / 100.0 * 1080 * FIT_SAFETY
+                total = 0.0
+                for k, (txt, fmt, _c) in enumerate(items):
+                    w100 = _measure_width_100(fmt, txt)
+                    if not w100:
+                        w100 = ROW_FONTS.get(fmt["font"], 0.66) * 100.0 * max(1, len(txt))
+                    total += w100 * fmt["size"] / 100.0 + fmt["spacing"] * len(txt)
+                    if k < len(items) - 1:   # the space between words
+                        total += 0.30 * fmt["size"]
+                if total > band_w > 0:
+                    scale = band_w / total
+            parts = []
+            tallest = ROWS_MIN_SIZE
+            for txt, fmt, (r, g, b) in items:
+                fs = max(ROWS_MIN_SIZE, int(fmt["size"] * scale))
+                tallest = max(tallest, fs)
+                parts.append("{" + _word_tags(fmt, fs) + rgb_to_ass_inline(r, g, b) + "}" + sanitize_ass_text(txt))
+            x_left = int(round(classic["left"] / 100.0 * 1080))
+            x_right = int(round((100.0 - classic["right"]) / 100.0 * 1080))
+            if classic["align"] == "left":
+                an, x = 4, x_left
+            elif classic["align"] == "right":
+                an, x = 6, x_right
+            else:
+                an, x = 5, (x_left + x_right) // 2
+            y = int(classic["pos"] / 100.0 * 1920)
+            y = max(tallest // 2, min(1920 - tallest // 2, y))
+            dialogue_lines.append(
+                f"Dialogue: 0,{format_ass_time(start)},{format_ass_time(end)},Default,,0,0,0,,"
+                + "{\\an" + str(an) + "\\pos(" + str(x) + "," + str(y) + ")\\q2}" + " ".join(parts)
+            )
+            continue
         parts = []
         for w in chunk_words:
             safe_w = sanitize_ass_text(w)
@@ -1826,6 +1971,8 @@ def render_captioned_clip(
             colors=colors,
             important_size=important_size,
             common_size=common_size,
+            # the own text formats only apply when the user really chose the classic look
+            classic=CLASSIC_CONFIG if caption_style == "classic" else None,
         )
     try:
         cut_vertical_clip(
@@ -1898,6 +2045,10 @@ def main():
     ROWS_CONFIG = parse_rows_config(args.rows_config) if caption_style == "behind" else None
     if ROWS_CONFIG:
         print(f"Custom caption rows: {sum(1 for r in ROWS_CONFIG if r['on'])} active")
+    global CLASSIC_CONFIG
+    CLASSIC_CONFIG = parse_classic_config(args.rows_config) if caption_style == "classic" else None
+    if CLASSIC_CONFIG:
+        print("Classic captions: own format for important and common words")
     is_behind = caption_style == "behind"
     important_size = clamp_text_size(
         args.important_size, BEHIND_IMPORTANT_SIZE if is_behind else DEFAULT_IMPORTANT_SIZE)
